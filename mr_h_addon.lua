@@ -5224,7 +5224,13 @@ end
 local function getRoom()
     local rooms = WS:FindFirstChild("CurrentRooms")
     local number = player:GetAttribute("CurrentRoom")
-    return rooms and number ~= nil and rooms:FindFirstChild(tostring(number)) or nil
+    if not rooms then return nil end
+    local current = number ~= nil and rooms:FindFirstChild(tostring(number))
+    if current then return current end
+    -- Some floors do not publish the player's CurrentRoom attribute.
+    local data = RS:FindFirstChild("GameData")
+    local latest = data and data:FindFirstChild("LatestRoom")
+    return latest and rooms:FindFirstChild(tostring(latest.Value)) or nil
 end
 
 local function inRooms()
@@ -5382,9 +5388,15 @@ local function candidates()
         end
         table.sort(list, function(a, b) return a.distance < b.distance end)
     end
+    local door = room and room:FindFirstChild("Door")
     local exit = room and room:FindFirstChild("RoomExit")
-    if exit and exit:IsA("BasePart") then
-        table.insert(list, { model = exit, door = room:FindFirstChild("Door"), position = exit.Position, kind = "door" })
+    if not (exit and exit:IsA("BasePart")) then
+        exit = door and (door:IsA("BasePart") and door
+            or door:FindFirstChild("Door", true) or door.PrimaryPart)
+        if exit and not exit:IsA("BasePart") then exit = nil end
+    end
+    if exit then
+        table.insert(list, { model = exit, door = door, position = exit.Position, kind = "door" })
     end
     return list
 end
@@ -5436,7 +5448,7 @@ local function plan()
             normal = normal.Unit
             if (inside - item.position):Dot(normal) < 0 then normal = -normal end
             item.crossing = item.position - normal * 3
-            goals = { item.position + normal * 2.5 }
+            goals = { item.position + normal * 4, item.position + normal * 7 }
         end
         for _, goal in ipairs(goals) do
             if movementMethod == "TP" then
@@ -5458,7 +5470,7 @@ local function plan()
             end
             local path = PF:CreatePath({ AgentRadius = 1.5, AgentHeight = 4, AgentCanJump = true, WaypointSpacing = 3 })
             local ok, waypoints = pcall(function()
-                path:ComputeAsync(startRoot.Position, ground(goal, exclude))
+                path:ComputeAsync(startRoot.Position, ground(goal, exclude) + Vector3.new(0, 2, 0))
                 if path.Status == Enum.PathStatus.Success then return path:GetWaypoints() end
             end)
             if token ~= revision or not enabled or unloaded or player.Character ~= expectedCharacter then
@@ -5517,6 +5529,11 @@ local function tickController()
     if foundThreat then lastThreat = now end
     local newThreat = foundThreat or now - lastThreat < CLEAR_DELAY
     local newRoom = getRoom()
+    if not newRoom then
+        invalidate()
+        status("Waiting for current room: CurrentRoom / LatestRoom unavailable.")
+        return
+    end
     local newHidden = character:GetAttribute("Hiding") == true
     if newThreat ~= threatMode or newRoom ~= room or newHidden ~= hidden then
         invalidate()
@@ -5868,7 +5885,7 @@ table.insert(connections, RunService.Heartbeat:Connect(function(dt)
     if not ok then
         invalidate()
         restoreSpeeds()
-        status("Auto Rooms error; see console.")
+        status("Pathfind error: " .. tostring(reason))
         if reason ~= lastError then lastError = reason warn("[AutoRooms] " .. tostring(reason)) end
     end
 end))
@@ -5894,7 +5911,7 @@ worker = task.spawn(function()
             if not ok then
                 invalidate()
                 retryAt = os.clock() + 1
-                status("Path calculation failed; retrying...")
+                status("Path calculation failed: " .. tostring(reason))
                 if reason ~= lastError then lastError = reason warn("[AutoRooms] " .. tostring(reason)) end
             end
         end
@@ -7301,7 +7318,7 @@ return {
         end
         if mrhMovement=="Pathfind" or Floor=="Rooms" then
             -- Avoid competing WalkSpeed and drawer-position controllers.
-            for _,toggle in ipairs({Toggles.SlideSpeedHack,Toggles.RakNetSpeedHack,Variables.SpeedHack,Toggles.BringDrawers}) do
+            for _,toggle in pairs({Toggles.SlideSpeedHack,Toggles.RakNetSpeedHack,Variables.SpeedHack,Toggles.BringDrawers}) do
                 if toggle and toggle.Value then toggle:SetValue(false) end
             end
             mrhActiveEngine="Pathfind"
