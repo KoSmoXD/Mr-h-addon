@@ -5133,6 +5133,788 @@ if game.GameId == 2440500124 then
 	StuffToRemoveLater.novelocitybro.MaxForce = Vector3.new(1/0, 1/0, 1/0)
 	StuffToRemoveLater.novelocitybro.Velocity = Vector3.zero
 
+    -- Integrated Auto Rooms engine: scoped locals, one movement owner.
+    local function createMrHPathfindEngine()
+local Players = game:GetService("Players")
+local WS = game:GetService("Workspace")
+local RS = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local PF = game:GetService("PathfindingService")
+local player = Players.LocalPlayer
+local lib = mspaint.Library or Library
+local enabled, unloaded, revision = false, false, 0
+local controlsTab
+local SPEED, CLEAR_DELAY = 40, 2
+local dangerNames = { A60 = true, A120 = true, RushMoving = true, AmbushMoving = true, BackdoorRush = true }
+local lockerNames = { Rooms_Locker = true, Rooms_Locker_Fridge = true, Locker_Large = true, Wardrobe = true, Toolshed = true }
+local connections, lockers, savedSpeeds = {}, {}, {}
+local route, visual, target, room, character, humanoid, root
+local threatMode, hidden, lastThreat, pauseUntil = false, false, -math.huge, 0
+local lastPrompt, lastExit, retryAt, lastProgress = 0, 0, 0, 0
+local progressPosition, waypointIndex, blockedConnection
+local statusLabel, previousStatus, worker, lastError
+local movementGoal
+local movementMethod, lastTP = "Pathfind", -math.huge
+local stopOnDoor, stopDoor, autoRoomsToggle = false, 1000, nil
+local pathColor = Color3.fromRGB(0, 255, 170)
+local turnCamera, smoothCamera = false, false
+local cameraRotation, lastCamera
+local selectedLoot, lootPrompts, lootCooldown, lootAttempts = {}, {}, {}, {}
+local lockerCooldown, hideAttempt = {}, nil
+local lootNames = { StardustPickup = "Stardust", GoldPile = "Gold", Battery = "Batteries" }
+local renderBinding = "MrHFloor_Movement_" .. game:GetService("HttpService"):GenerateGUID(false)
+
+local function status(text)
+    if text ~= previousStatus and not unloaded then
+        previousStatus = text
+        if statusLabel then statusLabel:SetText(text) end
+    end
+end
+
+local function stopMovement()
+    movementGoal = nil
+    if humanoid and humanoid.Parent then
+        humanoid.Jump = false
+        humanoid:Move(Vector3.zero)
+        if root and root.Parent then humanoid:MoveTo(root.Position) end
+    end
+end
+
+local function clearRoute()
+    if blockedConnection then blockedConnection:Disconnect() blockedConnection = nil end
+    if route then route.path:Destroy() route = nil end
+    if visual then visual:Destroy() visual = nil end
+end
+
+local function invalidate()
+    revision = revision + 1
+    target = nil
+    hideAttempt = nil
+    cameraRotation = nil
+    clearRoute()
+    stopMovement()
+    retryAt = 0
+    lastTP = -math.huge
+end
+
+local function restoreSpeeds()
+    for h, speed in pairs(savedSpeeds) do
+        if h.Parent then h.WalkSpeed = speed end
+    end
+    savedSpeeds = {}
+end
+
+local function setEnabled(value)
+    enabled = value == true and not unloaded
+    invalidate()
+    if not enabled then restoreSpeeds() end
+    status(enabled and "Starting..." or "Disabled")
+end
+
+local function cleanup()
+    if unloaded then return end
+    setEnabled(false)
+    unloaded = true
+    RunService:UnbindFromRenderStep(renderBinding)
+    for _, c in ipairs(connections) do c:Disconnect() end
+    if controlsTab then controlsTab:Destroy() controlsTab=nil end
+    -- A pending ComputeAsync finishes and discards its result by revision.
+end
+
+local function getRoom()
+    local rooms = WS:FindFirstChild("CurrentRooms")
+    local number = player:GetAttribute("CurrentRoom")
+    return rooms and number ~= nil and rooms:FindFirstChild(tostring(number)) or nil
+end
+
+local function inRooms()
+    local data = RS:FindFirstChild("GameData")
+    return WS:FindFirstChild("CurrentRooms") ~= nil and game.PlaceId ~= 6516141723
+end
+
+local function checkStopDoor()
+    if not enabled or not stopOnDoor or not inRooms() then return false end
+    -- Use this player's progress, not LatestRoom (which a teammate can advance).
+    local current = tonumber(player:GetAttribute("CurrentRoom"))
+    if not current or current < stopDoor then return false end
+    setEnabled(false)
+    if autoRoomsToggle then autoRoomsToggle:SetValue(false) end
+    status(string.format("Stopped at door %d (target %d).", current, stopDoor))
+    return true
+end
+
+local function remotes()
+    return RS:FindFirstChild("RemotesFolder") or RS:FindFirstChild("EntityInfo") or RS:FindFirstChild("Bricks")
+end
+
+local function promptPosition(prompt, model)
+    local parent = prompt.Parent
+    if parent and parent:IsA("Attachment") then return parent.WorldPosition end
+    if parent and parent:IsA("BasePart") then return parent.Position end
+    if model:IsA("BasePart") then return model.Position end
+    return model.PrimaryPart and model.PrimaryPart.Position or model:GetPivot().Position
+end
+
+local function lockerData(model)
+    if not model:IsDescendantOf(WS) or (lockerCooldown[model] or 0) > os.clock() then return nil end
+    local occupancy = model:FindFirstChild("HiddenPlayer", true)
+    -- Unknown/partially streamed occupancy is not proof that a locker is free.
+    if not occupancy or not occupancy:IsA("ObjectValue") or occupancy.Value ~= nil then return nil end
+    local prompt = model:FindFirstChild("HidePrompt", true)
+    if not prompt or not prompt:IsA("ProximityPrompt") or not prompt.Enabled then return nil end
+    return { model = model, prompt = prompt, position = promptPosition(prompt, model), kind = "locker" }
+end
+
+local function rejectLocker(model, reason)
+    lockerCooldown[model] = os.clock() + 8
+    invalidate()
+    status(reason .. "; finding another locker...")
+end
+
+local function canEnterLocker(item)
+    if not root or not item.prompt.Enabled then return false end
+    local margin = math.max(0, item.prompt.MaxActivationDistance - 1)
+    if (root.Position - item.position).Magnitude > margin then return false end
+    -- Being inside the prompt radius through a wall is not a reachable entry.
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = visual and { character, visual } or { character }
+    params.RespectCanCollide = true
+    local hit = WS:Raycast(root.Position, item.position - root.Position, params)
+    return not hit or hit.Instance:IsDescendantOf(item.model) or hit.Instance == item.model
+end
+
+local function activeThreat()
+    for _, object in ipairs(WS:GetChildren()) do
+        if dangerNames[object.Name] then
+            local part = object:IsA("Model") and object.PrimaryPart or (object:IsA("BasePart") and object)
+            if Floor ~= "Rooms" or not part or (part.Position.Y > -10 and part.Position.Y < 150) then return true end
+        end
+    end
+    return false
+end
+
+local function unsafeForLoot()
+    return threatMode or activeThreat() or hidden or os.clock() < pauseUntil
+        or (character and character:GetAttribute("Hiding") == true)
+end
+
+local function lootData(prompt)
+    if not room or not prompt:IsDescendantOf(room) or not prompt.Enabled
+        or (lootCooldown[prompt] or 0) > os.clock() then return nil end
+    local item = prompt.Parent
+    while item and item ~= room do
+        if item:GetAttribute("JeffShop") then return nil end
+        local category = lootNames[item.Name]
+        if category and selectedLoot[category] then
+            if not item:IsA("Model") and not item:IsA("BasePart") then return nil end
+            return { model = item, prompt = prompt, position = promptPosition(prompt, item), kind = "loot", category = category }
+        end
+        item = item.Parent
+    end
+    return nil
+end
+
+local function ground(point, exclude)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = exclude
+    params.RespectCanCollide = true
+    local hit = WS:Raycast(point + Vector3.new(0, 4, 0), Vector3.new(0, -20, 0), params)
+    return hit and hit.Position or point
+end
+
+local function showPath(points, kind)
+    if visual then visual:Destroy() end
+    visual = Instance.new("Folder")
+    visual.Name = "MrHFloor_Path"
+    local anchor = Instance.new("Part")
+    anchor.Anchored, anchor.CanCollide, anchor.CanTouch, anchor.CanQuery = true, false, false, false
+    anchor.Size, anchor.Transparency = Vector3.new(0.1, 0.1, 0.1), 1
+    anchor.CFrame = CFrame.new(points[1].Position)
+    anchor.Parent = visual
+    local previous
+    for _, waypoint in ipairs(points) do
+        local attachment = Instance.new("Attachment")
+        attachment.Position = anchor.CFrame:PointToObjectSpace(waypoint.Position + Vector3.new(0, 0.25, 0))
+        attachment.Parent = anchor
+        if previous then
+            local beam = Instance.new("Beam")
+            beam.Attachment0, beam.Attachment1 = previous, attachment
+            beam.Width0, beam.Width1, beam.FaceCamera = 0.16, 0.16, true
+            beam.Color = ColorSequence.new(pathColor)
+            beam.Transparency, beam.LightEmission = NumberSequence.new(0), 1
+            beam.LightInfluence, beam.Segments = 0, 1
+            beam.Parent = anchor
+        end
+        previous = attachment
+    end
+    visual.Parent = WS
+end
+
+-- Door movement copied from tplay v2.4.0 AutoFloor. The surrounding Rooms
+-- controller supplies hiding, loot priority, A90 pauses and Stop On Door.
+local function tplayDoorTeleport(Character, Door)
+    Character:PivotTo(Door:GetPivot())
+end
+
+local function candidates()
+    if threatMode then
+        local list = {}
+        for model in pairs(lockers) do
+            local item = lockerData(model)
+            if item then
+                item.distance = (item.position - root.Position).Magnitude
+                if item.distance < 750 then table.insert(list, item) end
+            end
+        end
+        table.sort(list, function(a, b) return a.distance < b.distance end)
+        return list
+    end
+    local list = {}
+    if not unsafeForLoot() then
+        for prompt in pairs(lootPrompts) do
+            local item = lootData(prompt)
+            if item then
+                item.distance = (item.position - root.Position).Magnitude
+                table.insert(list, item)
+            end
+        end
+        table.sort(list, function(a, b) return a.distance < b.distance end)
+    end
+    local exit = room and room:FindFirstChild("RoomExit")
+    if exit and exit:IsA("BasePart") then
+        table.insert(list, { model = exit, door = room:FindFirstChild("Door"), position = exit.Position, kind = "door" })
+    end
+    return list
+end
+
+local function plan()
+    local token, expectedCharacter, startRoot = revision, character, root
+    local list = candidates()
+    if #list == 0 then
+        status(threatMode and "No available locker loaded; waiting." or "Waiting for the next door...")
+        retryAt = os.clock() + 0.4
+        return
+    end
+    for _, item in ipairs(list) do
+        if token ~= revision or not enabled or unloaded then return end
+        if item.kind ~= "locker" and activeThreat() then invalidate() return end
+        if item.prompt and ((item.kind == "locker" and canEnterLocker(item))
+            or (item.kind == "loot" and (root.Position - item.position).Magnitude <= math.max(0, item.prompt.MaxActivationDistance - 0.25))) then
+            target = item
+            stopMovement()
+            return
+        end
+        local goals = {}
+        local exclude = { expectedCharacter }
+        if visual then table.insert(exclude, visual) end
+        if item.kind == "locker" then
+            -- Test both faces; never remove locker collision or path into its body.
+            local pivot = item.model:GetPivot()
+            local offset = math.min(3, math.max(1, item.prompt.MaxActivationDistance * 0.65))
+            local direction = Vector3.new(pivot.LookVector.X, 0, pivot.LookVector.Z)
+            if direction.Magnitude < 0.01 then direction = Vector3.new(0, 0, 1) end
+            direction = direction.Unit * offset
+            goals = { item.position + direction, item.position - direction }
+            table.sort(goals, function(a, b) return (a - startRoot.Position).Magnitude < (b - startRoot.Position).Magnitude end)
+        elseif item.kind == "loot" then
+            -- Try a point on the player's side of the pickup, then its floor
+            -- position, rather than navigating into a table or container.
+            local delta = startRoot.Position - item.position
+            local flat = Vector3.new(delta.X, 0, delta.Z)
+            local offset = math.min(2, item.prompt.MaxActivationDistance * 0.5)
+            local direction = flat.Magnitude > 0.01 and flat.Unit or Vector3.new(1, 0, 0)
+            goals = { item.position + direction * offset, item.position }
+        else
+            -- Approach a closed door from this room's side, so its collision
+            -- does not make the navigation endpoint unreachable.
+            local entrance = room:FindFirstChild("RoomEntrance")
+            local inside = entrance and entrance:IsA("BasePart") and entrance.Position or startRoot.Position
+            local normal = Vector3.new(item.model.CFrame.LookVector.X, 0, item.model.CFrame.LookVector.Z)
+            if normal.Magnitude < 0.01 then normal = Vector3.new(0, 0, 1) end
+            normal = normal.Unit
+            if (inside - item.position):Dot(normal) < 0 then normal = -normal end
+            item.crossing = item.position - normal * 3
+            goals = { item.position + normal * 2.5 }
+        end
+        for _, goal in ipairs(goals) do
+            if movementMethod == "TP" then
+                -- Use tplay's exact Door pivot for door TP. Locker/loot approach
+                -- points belong to this addon's priority controller.
+                if item.kind ~= "locker" and activeThreat() then invalidate() return end
+                local destination = item.kind == "door" and item.crossing or goal
+                local height = humanoid.HipHeight + root.Size.Y * 0.5
+                item.tpGoal = ground(destination, exclude) + Vector3.new(0, height, 0)
+                if item.kind == "door" and item.door then
+                    item.tpGoal = item.door:GetPivot().Position
+                end
+                item.tpStarted = os.clock()
+                target = item
+                clearRoute()
+                showPath({ { Position = startRoot.Position }, { Position = item.tpGoal } }, item.kind)
+                status("TP to " .. (item.kind == "locker" and "locker" or item.kind == "loot" and item.category or "next door"))
+                return
+            end
+            local path = PF:CreatePath({ AgentRadius = 1.5, AgentHeight = 4, AgentCanJump = true, WaypointSpacing = 3 })
+            local ok, waypoints = pcall(function()
+                path:ComputeAsync(startRoot.Position, ground(goal, exclude))
+                if path.Status == Enum.PathStatus.Success then return path:GetWaypoints() end
+            end)
+            if token ~= revision or not enabled or unloaded or player.Character ~= expectedCharacter then
+                path:Destroy()
+                return
+            end
+            if item.kind ~= "locker" and activeThreat() then path:Destroy() invalidate() return end
+            if ok and waypoints and #waypoints >= 2 then
+                if item.kind == "locker" and not lockerData(item.model) then path:Destroy() break end
+                if item.kind == "loot" and (unsafeForLoot() or not lootData(item.prompt)) then path:Destroy() break end
+                clearRoute()
+                target, route, waypointIndex = item, { path = path, points = waypoints }, 2
+                progressPosition, lastProgress = root.Position, os.clock()
+                blockedConnection = path.Blocked:Connect(function(index)
+                    if index >= waypointIndex then invalidate() end
+                end)
+                showPath(waypoints, item.kind)
+                status(item.kind == "locker" and "Entity detected: moving to locker"
+                    or (item.kind == "loot" and "Collecting " .. item.category or "Walking to the next door — speed 40"))
+                return
+            end
+            path:Destroy()
+        end
+        if item.kind == "loot" then lootCooldown[item.prompt] = os.clock() + 10 end
+        if item.kind == "locker" then lockerCooldown[item.model] = os.clock() + 3 end
+    end
+    status(threatMode and "No reachable locker; retrying..." or "Door route blocked; retrying...")
+    retryAt = os.clock() + 0.5
+end
+
+local function tickController()
+    if not enabled or unloaded then return end
+    if lib and lib.Unloaded then cleanup() return end
+    if checkStopDoor() then return end
+    if not inRooms() then
+        if route or character then invalidate() restoreSpeeds() character = nil end
+        status("Waiting for loaded rooms...")
+        return
+    end
+    local newCharacter = player.Character
+    local newHumanoid = newCharacter and newCharacter:FindFirstChildOfClass("Humanoid")
+    local newRoot = newCharacter and newCharacter:FindFirstChild("HumanoidRootPart")
+    if newCharacter ~= character or newHumanoid ~= humanoid or newRoot ~= root then
+        invalidate()
+        restoreSpeeds()
+        character, humanoid, root = newCharacter, newHumanoid, newRoot
+    end
+    if not root or not humanoid or humanoid.Health <= 0 then
+        invalidate()
+        restoreSpeeds()
+        status("Waiting for your character...")
+        return
+    end
+    local now = os.clock()
+    local foundThreat = activeThreat()
+    if foundThreat then lastThreat = now end
+    local newThreat = foundThreat or now - lastThreat < CLEAR_DELAY
+    local newRoom = getRoom()
+    local newHidden = character:GetAttribute("Hiding") == true
+    if newThreat ~= threatMode or newRoom ~= room or newHidden ~= hidden then
+        invalidate()
+        threatMode, room, hidden = newThreat, newRoom, newHidden
+    end
+    if savedSpeeds[humanoid] == nil then savedSpeeds[humanoid] = humanoid.WalkSpeed end
+    if now < pauseUntil then
+        humanoid.WalkSpeed = 0
+        stopMovement()
+        status("A-90: holding still")
+        return
+    end
+    humanoid.WalkSpeed = SPEED
+    if hidden then
+        stopMovement()
+        if threatMode then status("Hiding until the entity clears") return end
+        local folder = remotes()
+        local remote = folder and folder:FindFirstChild("CamLock")
+        if remote and remote:IsA("RemoteEvent") then
+            if now - lastExit > 1 then lastExit = now remote:FireServer() end
+            status("Leaving locker...")
+        else
+            status("Exit remote unavailable; leave the locker manually.")
+        end
+        return
+    end
+    -- A single entry request is outstanding. Never spam the prompt or treat
+    -- firing it as success. Only the game's Hiding attribute confirms entry.
+    if hideAttempt then
+        local attempt = hideAttempt
+        stopMovement()
+        local occupancy = attempt.model:FindFirstChild("HiddenPlayer", true)
+        if not attempt.model:IsDescendantOf(WS) or not attempt.prompt.Parent then
+            rejectLocker(attempt.model, "Locker disappeared")
+        elseif occupancy and occupancy:IsA("ObjectValue") and occupancy.Value ~= nil
+            and occupancy.Value ~= character and occupancy.Value ~= player then
+            rejectLocker(attempt.model, "Locker taken by another player")
+        elseif now >= attempt.deadline then
+            rejectLocker(attempt.model, "Hide was not confirmed")
+        else
+            status("Waiting for locker entry confirmation...")
+        end
+        return
+    end
+    -- Never interact with loot until the threat and its clear-delay have ended.
+    if target and target.kind == "loot" then
+        if unsafeForLoot() then invalidate() return end
+        local item = lootData(target.prompt)
+        if not item then invalidate() return end
+        target.position = item.position
+        if (root.Position - item.position).Magnitude <= math.max(0, item.prompt.MaxActivationDistance - 0.25) then
+            stopMovement()
+            status("Picking up " .. item.category)
+            if now - lastPrompt >= 0.4 then
+                lastPrompt = now
+                local attempts = (lootAttempts[item.prompt] or 0) + 1
+                lootAttempts[item.prompt] = attempts
+                -- Recheck immediately before interacting: no yields between
+                -- this guard and the prompt call, even if a path was pending.
+                if unsafeForLoot() then invalidate() return end
+                fireproximityprompt(item.prompt)
+                if attempts >= 3 then
+                    lootCooldown[item.prompt], lootAttempts[item.prompt] = os.clock() + 10, nil
+                    invalidate()
+                end
+            end
+            return
+        end
+    end
+    if target and target.kind == "locker" then
+        local item = lockerData(target.model)
+        if not item then rejectLocker(target.model, "Locker unavailable") return end
+        if canEnterLocker(item) then
+            stopMovement()
+            local hold = item.prompt.HoldDuration
+            local attempt = { model = item.model, prompt = item.prompt,
+                deadline = now + math.max(1.2, hold + 0.8), token = revision }
+            hideAttempt = attempt
+            status("Requesting locker entry...")
+            local ok = pcall(fireproximityprompt, item.prompt, hold)
+            if not ok and hideAttempt == attempt and revision == attempt.token then
+                rejectLocker(item.model, "Hide interaction failed")
+            end
+            return
+        end
+    end
+    if movementMethod == "TP" and target and target.tpGoal then
+        stopMovement()
+        local collision = character:FindFirstChild("Collision", true)
+        if root.Anchored or (collision and collision:IsA("BasePart") and collision.Anchored)
+            or humanoid.PlatformStand or humanoid.Sit then
+            status("TP paused: character immobilized.")
+            return
+        end
+        if now - target.tpStarted > 3 then
+            if target.kind == "locker" then
+                rejectLocker(target.model, "TP locker entry unavailable")
+            else
+                if target.kind == "loot" then lootCooldown[target.prompt] = now + 10 end
+                invalidate()
+                retryAt = now + 0.5
+                status("TP not confirmed; retrying. Server may reject teleporting.")
+            end
+            return
+        end
+        if target.kind == "door" or now - lastTP >= 0.35 then
+            if target.kind ~= "locker" and unsafeForLoot() then invalidate() return end
+            lastTP = now
+            if target.kind == "door" then
+                local Door = target.door
+                if not Door or not Door:IsDescendantOf(WS) then
+                    invalidate()
+                    status("Waiting for the door model to load...")
+                    return
+                end
+                -- Original AutoFloor action, repeated on Heartbeat.
+                tplayDoorTeleport(character, Door)
+            else
+                character:PivotTo(character:GetPivot() + (target.tpGoal - root.Position))
+            end
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end
+        return
+    end
+    -- An in-range target can be selected without a path. Replan if it moves
+    -- or the character is pushed outside its interaction range.
+    if target and not route then invalidate() return end
+    if route then
+        if target.kind == "door" and (root.Position - target.position).Magnitude < 6 then
+            -- Advance through the threshold using normal walking/proximity opening.
+            movementGoal = target.crossing or target.position
+            if now - lastProgress > 2 then invalidate() end
+            return
+        end
+        local point = route.points[waypointIndex]
+        if not point then
+            if target.kind == "locker" then rejectLocker(target.model, "Locker entrance blocked") else invalidate() end
+            return
+        end
+        local delta = root.Position - point.Position
+        if Vector3.new(delta.X, 0, delta.Z).Magnitude < 2 and math.abs(delta.Y) < 6 then
+            waypointIndex = waypointIndex + 1
+            point = route.points[waypointIndex]
+            if not point then
+                if target.kind == "locker" then rejectLocker(target.model, "Locker entrance blocked") else invalidate() end
+                return
+            end
+        end
+        if point.Action == Enum.PathWaypointAction.Jump then humanoid.Jump = true end
+        movementGoal = point.Position
+        if (root.Position - progressPosition).Magnitude >= 1 then
+            progressPosition, lastProgress = root.Position, now
+        elseif now - lastProgress > 1.2 then
+            if target.kind == "loot" then lootCooldown[target.prompt] = now + 10 end
+            if target.kind == "locker" then rejectLocker(target.model, "Locker route blocked") return end
+            invalidate()
+            status("Recalculating blocked route...")
+        end
+    end
+end
+
+local function updateCamera(dt)
+    if not turnCamera or not enabled or unloaded or not target or not inRooms()
+        or not character or player.Character ~= character or not humanoid or humanoid.Health <= 0
+        or character:GetAttribute("Hiding") == true or os.clock() < pauseUntil
+        or (target.kind ~= "locker" and (threatMode or activeThreat())) then
+        cameraRotation = nil
+        return
+    end
+    local camera = WS.CurrentCamera
+    if not camera or not target.model:IsDescendantOf(WS) then cameraRotation = nil return end
+    if camera ~= lastCamera then cameraRotation, lastCamera = nil, camera end
+    local aim = target.position
+    if target.prompt and target.prompt.Parent then aim = promptPosition(target.prompt, target.model) end
+    local position = camera.CFrame.Position
+    local delta = aim - position
+    if delta.Magnitude < 0.1 then return end
+    local up = math.abs(delta.Unit.Y) > 0.999 and Vector3.new(0, 0, 1) or Vector3.new(0, 1, 0)
+    local desired = CFrame.lookAt(position, aim, up).Rotation
+    if smoothCamera then
+        local alpha = 1 - math.exp(-10 * math.max(0, dt))
+        cameraRotation = (cameraRotation or camera.CFrame.Rotation):Lerp(desired, alpha)
+    else
+        cameraRotation = desired
+    end
+    -- Preserve the game's camera position, type, subject, zoom and FOV.
+    camera.CFrame = CFrame.new(position) * cameraRotation
+end
+
+-- Humanoid:Move from the default player controls can cancel MoveTo. Submit our
+-- world-space steering after those controls each frame, while leaving their
+-- enabled state untouched. Turning this addon off immediately releases movement.
+local function driveMovement()
+    if not enabled or unloaded or not inRooms() then return end
+    if lib and lib.Unloaded then cleanup() return end
+    if checkStopDoor() then return end
+    if not character or player.Character ~= character or not humanoid or not root
+        or not root.Parent or humanoid.Health <= 0 then return end
+    if target and target.kind ~= "locker" and activeThreat() then invalidate() return end
+    if os.clock() < pauseUntil or character:GetAttribute("Hiding") == true then
+        humanoid:Move(Vector3.zero, false)
+        if os.clock() < pauseUntil then humanoid.WalkSpeed = 0 end
+        return
+    end
+    if not movementGoal then
+        humanoid:Move(Vector3.zero, false)
+        return
+    end
+    local collision = character:FindFirstChild("Collision", true)
+    if root.Anchored or (collision and collision:IsA("BasePart") and collision.Anchored) then
+        humanoid:Move(Vector3.zero, false)
+        status("Movement blocked: character anchored. Leave hiding/cutscene first.")
+        return
+    end
+    if humanoid.PlatformStand or humanoid.Sit then
+        humanoid:Move(Vector3.zero, false)
+        status("Movement blocked: character seated or immobilized.")
+        return
+    end
+    local delta = movementGoal - root.Position
+    local flat = Vector3.new(delta.X, 0, delta.Z)
+    humanoid.WalkSpeed = SPEED
+    humanoid:Move(flat.Magnitude > 0.5 and flat.Unit or Vector3.zero, false)
+end
+
+local function watchLocker(object)
+    if object:IsA("Model") and lockerNames[object.Name] then lockers[object] = true end
+    if object:IsA("ProximityPrompt") then lootPrompts[object] = true end
+end
+for _, object in ipairs(WS:GetDescendants()) do watchLocker(object) end
+table.insert(connections, WS.DescendantAdded:Connect(watchLocker))
+table.insert(connections, WS.DescendantRemoving:Connect(function(object)
+    lockers[object], lootPrompts[object], lootCooldown[object], lootAttempts[object] = nil, nil, nil, nil
+    lockerCooldown[object] = nil
+end))
+
+local seenA90 = {}
+local function watchA90(object)
+    if object.Name == "A90" and object:IsA("RemoteEvent") and not seenA90[object] then
+        seenA90[object] = true
+        table.insert(connections, object.OnClientEvent:Connect(function()
+            if enabled then pauseUntil = os.clock() + 2 invalidate() end
+        end))
+    end
+end
+for _, object in ipairs(RS:GetDescendants()) do watchA90(object) end
+table.insert(connections, RS.DescendantAdded:Connect(watchA90))
+
+local box, credits, loot = mspaint.Groupbox, mspaint.Groupbox, mspaint.Groupbox
+local settings = mspaint.Groupbox
+if Window and type(Window.AddTab) == "function" then
+    local tab = Window:AddTab("Auto Floor Settings", "route")
+    controlsTab=tab
+    box = tab:AddLeftGroupbox("Main")
+    loot = tab:AddLeftGroupbox("Loot")
+    settings = tab:AddRightGroupbox("Settings")
+    credits = tab:AddRightGroupbox("Credits")
+    box:AddLabel("Controlled by Main > Auto Floor. Pathfind navigates ordinary doors; floor puzzles may need manual completion or TP mode.", true)
+else
+    box:AddLabel("Main")
+end
+statusLabel = box:AddLabel("Disabled", true)
+autoRoomsToggle = {SetValue=function(_,value)
+    if not value then
+        setEnabled(false)
+        if Toggles.AutoFloor and Toggles.AutoFloor.Value then Toggles.AutoFloor:SetValue(false) end
+    end
+end}
+local cameraToggle = box:AddToggle("MrHFloor_TurnCamera", {
+    Text = "Turn camera on object",
+    Default = false,
+    Tooltip = "Look at the current door, locker or loot target.",
+    Callback = function(value) turnCamera = value == true cameraRotation = nil end,
+})
+local cameraOptions = box:AddDependencyBox()
+cameraOptions:AddToggle("MrHFloor_SmoothCamera", {
+    Text = "Smooth Camera",
+    Default = false,
+    Callback = function(value) smoothCamera = value == true cameraRotation = nil end,
+})
+cameraOptions:SetupDependencies({ { cameraToggle, true } })
+box:AddLabel("Pathfind speed: 40 | TP: direct teleport", true)
+if settings == box then settings:AddDivider() settings:AddLabel("Settings") end
+local stopToggle = settings:AddToggle("MrHFloor_StopOnDoor", {
+    Text = "Stop On Door",
+    Default = false,
+    Tooltip = "Turn Auto Rooms off when you reach this room number or have already passed it.",
+    Callback = function(value) stopOnDoor = value == true end,
+})
+local stopOptions = settings:AddDependencyBox()
+local stopHint = stopOptions:AddLabel("Only numbers 2-1000", true)
+local stopInput
+stopInput = stopOptions:AddInput("MrHFloor_StopDoorNumber", {
+    Text = "Door number",
+    Default = "1000",
+    Numeric = true,
+    Finished = true,
+    ClearTextOnFocus = false,
+    Callback = function(value)
+        local text = tostring(value)
+        local number = text:match("^%d+$") and tonumber(text)
+        if not number or number < 2 or number > 1000 then
+            if stopInput then stopInput:SetValue(tostring(stopDoor)) end
+            stopHint:SetText("Only numbers 2-1000. Previous value kept.")
+            return
+        end
+        stopDoor = number
+        stopHint:SetText("Only numbers 2-1000")
+    end,
+})
+stopOptions:SetupDependencies({ { stopToggle, true } })
+settings:AddLabel("Pathfind color"):AddColorPicker("MrHFloor_PathColor", {
+    Default = pathColor,
+    Title = "Pathfind color",
+    Resizable = true,
+    Callback = function(value)
+        pathColor = value
+        if visual then
+            for _, object in ipairs(visual:GetDescendants()) do
+                if object:IsA("Beam") then object.Color = ColorSequence.new(pathColor) end
+            end
+        end
+    end,
+})
+if loot == box then loot:AddDivider() loot:AddLabel("Loot") end
+loot:AddDropdown("MrHFloor_Loot", {
+    Text = "Select loot",
+    Values = { "Stardust", "Gold", "Batteries" },
+    Multi = true,
+    AllowNull = true,
+    Tooltip = "Collect selected loot in the current room. Hiding always takes priority.",
+    Callback = function(value)
+        selectedLoot = type(value) == "table" and value or {}
+        if enabled and not threatMode and not hidden and os.clock() >= pauseUntil then invalidate() end
+    end,
+})
+loot:AddLabel("Priority: Hide first, selected loot next, then the door.", true)
+if credits == box then credits:AddDivider() credits:AddLabel("Credits") end
+credits:AddLabel('<font color="#FFFF00">Mr H - Owner</font>', true)
+credits:AddLabel("chat gpt astra - uhhh idk", true)
+
+local elapsed = 0
+table.insert(connections, RunService.Heartbeat:Connect(function(dt)
+    elapsed = elapsed + dt
+    if elapsed < 0.05 then return end
+    elapsed = 0
+    local ok, reason = pcall(tickController)
+    if not ok then
+        invalidate()
+        restoreSpeeds()
+        status("Auto Rooms error; see console.")
+        if reason ~= lastError then lastError = reason warn("[AutoRooms] " .. tostring(reason)) end
+    end
+end))
+OnUnload(cleanup)
+RunService:BindToRenderStep(renderBinding, Enum.RenderPriority.Last.Value + 1, function(dt)
+    local ok, reason = pcall(driveMovement)
+    if not ok then
+        setEnabled(false)
+        status("Movement error; see console.")
+        warn("[AutoRooms movement] " .. tostring(reason))
+    end
+    local cameraOk, cameraError = pcall(updateCamera, dt)
+    if not cameraOk then
+        turnCamera, cameraRotation = false, nil
+        warn("[AutoRooms camera] " .. tostring(cameraError))
+    end
+end)
+worker = task.spawn(function()
+    while not unloaded do
+        if enabled and inRooms() and humanoid and humanoid.Health > 0 and root and room
+            and not hidden and os.clock() >= pauseUntil and not route and not target and os.clock() >= retryAt then
+            local ok, reason = pcall(plan)
+            if not ok then
+                invalidate()
+                retryAt = os.clock() + 1
+                status("Path calculation failed; retrying...")
+                if reason ~= lastError then lastError = reason warn("[AutoRooms] " .. tostring(reason)) end
+            end
+        end
+        task.wait(0.1)
+    end
+end)
+
+return {
+    SetEnabled=function(value,method)
+        if value and type(fireproximityprompt)~="function" then error("Auto Floor Pathfind requires fireproximityprompt") end
+        movementMethod=method or "Pathfind"
+        setEnabled(value)
+    end,
+    IsEnabled=function() return enabled end,
+    Destroy=cleanup,
+}
+
+    end
+    local mrhPathfindEngine=createMrHPathfindEngine()
+
 	Variables.AutoFloors = {
 		Hotel = {
 			Requirements = {
@@ -6496,17 +7278,62 @@ if game.GameId == 2440500124 then
 	Variables.AutoFloorFunc = Variables.AutoFloors[Floor] or Variables.AutoFloors[`{Floor}_{FloorSpecific}`]
 	Variables.AutoFloorSupported = ExecutorSupported(Variables.AutoFloorFunc or {Requirements = {}})
 
-	Toggles.AutoFloor = Groupbox:AddToggle(prefix.."AutoFloor", {
-		Text = "Auto Floor",
-		DisabledTooltip = Variables.AutoFloorSupported and (Variables.AutoFloorFunc and "Floor is already completed" or "Auto Floor is not supported for this floor") or "Executor is not supported",
-		Default = false,
-		Disabled = not (Variables.AutoFloorSupported and Variables.AutoFloorFunc),
-
-		Callback = function(value)
-            if not value then mrhReleasePause() end
-            if Variables.AutoFloorFunc then Variables.AutoFloorFunc.Callback(value) end
+    local mrhMovement = Floor=="Rooms" and "Pathfind" or "TP"
+    local mrhActiveEngine = nil
+    local function mrhCanRun()
+        if mrhMovement=="Pathfind" or Floor=="Rooms" then return type(fireproximityprompt)=="function" end
+        return Variables.AutoFloorSupported and Variables.AutoFloorFunc~=nil
+    end
+    local function mrhStopEngine()
+        local previous=mrhActiveEngine
+        mrhActiveEngine=nil
+        mrhPathfindEngine.SetEnabled(false)
+        if previous=="TP" and Variables.AutoFloorFunc then Variables.AutoFloorFunc.Callback(false) end
+        mrhReleasePause()
+    end
+    local function mrhRunEngine(value)
+        mrhStopEngine()
+        if not value then return end
+        if not mrhCanRun() then
+            Library:Notify({Title="Auto Floor",Description="Selected method is unavailable on this floor or executor.",Time=5})
+            if Toggles.AutoFloor then Toggles.AutoFloor:SetValue(false) end
+            return
         end
-	})
+        if mrhMovement=="Pathfind" or Floor=="Rooms" then
+            -- Avoid competing WalkSpeed and drawer-position controllers.
+            for _,toggle in ipairs({Toggles.SlideSpeedHack,Toggles.RakNetSpeedHack,Variables.SpeedHack,Toggles.BringDrawers}) do
+                if toggle and toggle.Value then toggle:SetValue(false) end
+            end
+            mrhActiveEngine="Pathfind"
+            mrhPathfindEngine.SetEnabled(true,mrhMovement)
+        else
+            mrhActiveEngine="TP"
+            Variables.AutoFloorFunc.Callback(true)
+        end
+    end
+    Groupbox:AddDropdown(prefix.."AutoFloorMovement", {
+        Text="Auto Floor Movement",Values={"TP","Pathfind"},Default=mrhMovement,Multi=false,
+        Tooltip="TP: tplay floor solver. Pathfind: walk at speed 40 with priority hiding, loot and camera settings. Special floor puzzles may require manual completion. Rooms supports both methods through the imported engine.",
+        Callback=function(value)
+            if value==mrhMovement then return end
+            local resume=Toggles.AutoFloor and Toggles.AutoFloor.Value
+            mrhStopEngine()
+            mrhMovement=value
+            if Toggles.AutoFloor then
+                Toggles.AutoFloor:SetDisabled(not mrhCanRun())
+                if resume then
+                    if mrhCanRun() then mrhRunEngine(true) else Toggles.AutoFloor:SetValue(false) end
+                end
+            end
+        end,
+    })
+    Toggles.AutoFloor=Groupbox:AddToggle(prefix.."AutoFloor", {
+        Text="Auto Floor",Default=false,Disabled=not mrhCanRun(),
+        DisabledTooltip="Choose Pathfind or use a supported TP floor/executor.",
+        Callback=mrhRunEngine,
+    })
+    Groupbox:AddLabel("Pathfind / Rooms controls: Auto Floor Settings tab. Normal/Safe/Rush applies to tplay TP; the imported engine always puts hiding first.",true)
+    OnUnload(mrhStopEngine)
 
 	if Floor == "Garden" then
 		local cutscenes = {}
