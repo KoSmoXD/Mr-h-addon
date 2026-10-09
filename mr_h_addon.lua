@@ -6665,7 +6665,7 @@ loaded = true
 
 -- Local minigame; no game remotes or world changes.
 do
-    local tab = Window:AddTab("Bullshit", "gamepad-2")
+    local tab = Window:AddTab("Snake", "gamepad-2")
     local box = tab:AddLeftGroupbox("Snake")
     local controls = tab:AddRightGroupbox("Controls")
     local scoreLabel = box:AddLabel("Score: 0 | Best: 0")
