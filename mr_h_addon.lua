@@ -7492,6 +7492,17 @@ loaded = true
 
 -- Local minigame; no game remotes or world changes.
 do
+    local snakeEnvironment = getgenv()
+    if snakeEnvironment._MRH_SNAKE_CLEANUP then
+        snakeEnvironment._MRH_SNAKE_CLEANUP()
+    end
+    -- Remove the old title left behind by an earlier addon reload.
+    for _, name in ipairs({"Bullshit", "Snake"}) do
+        local previousTab = Library.Tabs[name]
+        if previousTab and not previousTab.Destroyed then
+            previousTab:Destroy()
+        end
+    end
     local tab = Window:AddTab("Snake", "gamepad-2")
     local box = tab:AddLeftGroupbox("Snake")
     local controls = tab:AddRightGroupbox("Controls")
@@ -7626,10 +7637,16 @@ do
         elapsed=elapsed+dt
         if elapsed>=0.14 then elapsed=0 step() end
     end)
-    OnUnload(function()
+    local function cleanupSnake()
+        if disposed then return end
         disposed=true running=false
         heartbeat:Disconnect()
         actions:UnbindAction(actionName)
-        tab:Destroy()
-    end)
+        if not tab.Destroyed then tab:Destroy() end
+        if snakeEnvironment._MRH_SNAKE_CLEANUP == cleanupSnake then
+            snakeEnvironment._MRH_SNAKE_CLEANUP = nil
+        end
+    end
+    snakeEnvironment._MRH_SNAKE_CLEANUP = cleanupSnake
+    OnUnload(cleanupSnake)
 end
