@@ -7514,13 +7514,13 @@ do
         snakeEnvironment._MRH_SNAKE_CLEANUP()
     end
     -- Remove the old title left behind by an earlier addon reload.
-    for _, name in ipairs({"Bullshit", "Snake"}) do
+    for _, name in ipairs({"Bullshit", "Snake", "Get Unbored"}) do
         local previousTab = Library.Tabs[name]
         if previousTab and not previousTab.Destroyed then
             previousTab:Destroy()
         end
     end
-    local tab = Window:AddTab("Snake", "gamepad-2")
+    local tab = Window:AddTab("Get Unbored", "gamepad-2")
     local box = tab:AddLeftGroupbox("Snake")
     local controls = tab:AddRightGroupbox("Controls")
     local scoreLabel = box:AddLabel("Score: 0 | Best: 0")
@@ -7666,4 +7666,42 @@ do
     end
     snakeEnvironment._MRH_SNAKE_CLEANUP = cleanupSnake
     OnUnload(cleanupSnake)
+end
+
+-- YouTube link handoff. Roblox VideoFrame cannot play YouTube URLs.
+do
+    local previous = Library.Tabs["Youtube"]
+    if previous and not previous.Destroyed then previous:Destroy() end
+    local tab = Window:AddTab("Youtube", "youtube")
+    local box = tab:AddLeftGroupbox("Watch on YouTube")
+    box:AddLabel("Watch in the YouTube app or your browser. YouTube videos cannot play inside this Roblox tab.", true)
+    local link = "https://www.youtube.com/"
+    box:AddInput("MrHYouTubeLink", {
+        Text = "YouTube link", Default = link,
+        Placeholder = "https://www.youtube.com/watch?v=...",
+        Finished = false,
+        Callback = function(value) link = tostring(value or "") end,
+    })
+    local status = box:AddLabel("Paste a link, copy it, then open it in YouTube or your browser.", true)
+    box:AddButton({Text = "Copy Link", Func = function()
+        local url = link:match("^%s*(.-)%s*$")
+        if url == "" then url = "https://www.youtube.com/" end
+        if not url:match("^https?://") then url = "https://" .. url end
+        local host = url:match("^https?://([^/%?#]+)")
+        host = host and host:lower()
+        if host ~= "youtube.com" and host ~= "www.youtube.com" and host ~= "m.youtube.com" and host ~= "youtu.be" then
+            status:SetText("Enter a youtube.com or youtu.be link.")
+            return
+        end
+        local copy = setclipboard or toclipboard
+        if type(copy) ~= "function" then
+            status:SetText("Clipboard unavailable. Select the link above and copy it manually.")
+            return
+        end
+        local ok = pcall(copy, url)
+        status:SetText(ok and "Copied! Paste into YouTube or your browser to watch." or "Copy failed. Copy the link above manually.")
+    end})
+    OnUnload(function()
+        if not tab.Destroyed then tab:Destroy() end
+    end)
 end
