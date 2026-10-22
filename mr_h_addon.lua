@@ -6719,6 +6719,7 @@ do
     local snake, food, direction, pending = {}, nil, {x=1,y=0}, nil
     local score,best,elapsed=0,0,0
     local running,alive,disposed=false,false,false
+    local miniGDInputActive
     local input=Services.UserInputService
     local actions=Services.ContextActionService
     local actionName="MrHAddonSnakeInput"
@@ -6801,7 +6802,7 @@ do
         [Enum.KeyCode.D]={1,0}, [Enum.KeyCode.Right]={1,0},
     }
     actions:BindActionAtPriority(actionName,function(_,state,event)
-        if disposed or not visible() or input:GetFocusedTextBox() or not alive then
+        if disposed or (miniGDInputActive and miniGDInputActive()) or not visible() or input:GetFocusedTextBox() or not alive then
             return Enum.ContextActionResult.Pass
         end
         if event.KeyCode==Enum.KeyCode.Space then
@@ -7083,10 +7084,220 @@ do
         end
     end)()
 
+    -- Mini GD: original local cube-runner level, rendered entirely in Roblox UI.
+    local cleanupMiniGD = (function()
+        local gameBox=tab:AddLeftGroupbox("Mini GD")
+        local buttons=tab:AddRightGroupbox("Mini GD controls")
+        local hud=gameBox:AddLabel("Neon Steps | 0% | best 0% | attempt 0",true)
+        local message=buttons:AddLabel("Enable Mini GD, then press Start.",true)
+        buttons:AddLabel("Space, tap the canvas, or press Jump. Clear the spikes and land on the platforms. Leaving this tab pauses your run.",true)
+        local inputService=Services.UserInputService
+        local actionService=Services.ContextActionService
+        local actionName="MrHMiniGDJump"
+        local enabled,disposed,autoRestart=false,false,true
+        local state="ready"
+        local x,y,vy,rotation=0,0,0,0
+        local grounded=true
+        local buffer,coyote,accumulator,retryTime,hudTime=0,0,0,0,0
+        local attempt,best=0,tonumber(snakeEnvironment._MRH_MINIGD_BEST) or 0
+        local LENGTH,SPEED,GRAVITY,JUMP,SIZE=3600,110,600,240,14
+        local STEP=1/120
+        local canvas,cube,fill,finish
+        local visuals,signals,level={},{},{}
+        local function spike(px,base) level[#level+1]={kind="spike",x=px,y=base or 0,w=16,h=16} end
+        local function platform(px,width,height) level[#level+1]={kind="block",x=px,y=0,w=width,h=height} end
+        -- Wide opening beats, followed by short raised platforms and paired spikes.
+        for _,px in ipairs({240,420,620,640,850,1080,1300,1320,1810,2060,2080,2350,2830,2850,3190,3390}) do spike(px) end
+        platform(1470,96,22) spike(1514,22)
+        platform(2510,100,24) spike(2558,24)
+        platform(2990,62,20)
+        local function visible()
+            if not enabled or not canvas or not canvas.Parent then return false end
+            local object=canvas
+            while object do
+                if object:IsA("GuiObject") and not object.Visible then return false end
+                if object:IsA("ScreenGui") and not object.Enabled then return false end
+                object=object.Parent
+            end
+            return true
+        end
+        local function ownsInput()
+            if not visible() then return false end
+            -- Do not capture Space when the game has scrolled outside the viewport.
+            local top,bottom=canvas.AbsolutePosition.Y,canvas.AbsolutePosition.Y+canvas.AbsoluteSize.Y
+            local parent=canvas.Parent
+            while parent do
+                if parent:IsA("GuiObject") and parent.ClipsDescendants then
+                    if bottom<=parent.AbsolutePosition.Y or top>=parent.AbsolutePosition.Y+parent.AbsoluteSize.Y then return false end
+                end
+                parent=parent.Parent
+            end
+            return true
+        end
+        local function updateHUD()
+            local percent=math.clamp(math.floor(x/LENGTH*100),0,100)
+            hud:SetText("Neon Steps | "..percent.."% | best "..best.."% | attempt "..attempt)
+            if fill then fill.Size=UDim2.fromScale(percent/100,1) end
+        end
+        local function recordBest()
+            best=math.max(best,math.clamp(math.floor(x/LENGTH*100),0,100))
+            snakeEnvironment._MRH_MINIGD_BEST=best
+        end
+        local function draw()
+            if not canvas then return end
+            local camera=x-55
+            cube.Position=UDim2.fromScale(55/320,(144-y-SIZE)/180)
+            cube.Rotation=rotation%360
+            cube.BackgroundColor3=state=="dead" and Color3.fromRGB(255,90,110) or Color3.fromRGB(120,240,255)
+            for i,object in ipairs(level) do
+                local sx=object.x-camera
+                local gui=visuals[i]
+                gui.Visible=sx+object.w>=0 and sx<=320
+                if gui.Visible then gui.Position=UDim2.fromScale(sx/320,(144-object.y-object.h)/180) end
+            end
+            finish.Position=UDim2.fromScale((LENGTH-camera)/320,44/180)
+        end
+        local function die()
+            state="dead" retryTime=0.6 buffer=0
+            recordBest() updateHUD()
+            message:SetText(autoRestart and "Crashed! Restarting..." or "Crashed! Press Start / Restart.")
+        end
+        local function start()
+            if not canvas then return end
+            x,y,vy,rotation=0,0,0,0 grounded=true
+            buffer,coyote,accumulator,retryTime,hudTime=0,0,0,0,0
+            attempt=attempt+1 state="playing"
+            message:SetText("Playing — tap / Space to jump.") updateHUD() draw()
+        end
+        local function jump()
+            if not ownsInput() then return end
+            if state=="ready" or state=="dead" or state=="won" then start() end
+            if state=="playing" then buffer=0.1 end
+        end
+        local function physics(dt)
+            if state~="playing" then return end
+            buffer=math.max(0,buffer-dt)
+            if grounded then coyote=0.07 else coyote=math.max(0,coyote-dt) end
+            if buffer>0 and coyote>0 then vy=JUMP grounded=false coyote=0 buffer=0 end
+            local oldY=y
+            x=x+SPEED*dt vy=vy-GRAVITY*dt y=y+vy*dt
+            grounded=false
+            if y<=0 then y=0 vy=0 grounded=true end
+            for _,o in ipairs(level) do
+                if x+SIZE<=o.x or x>=o.x+o.w then continue end
+                if o.kind=="spike" then
+                    local center=o.x+o.w/2
+                    local closest=math.clamp(center,x,x+SIZE)
+                    local peak=o.y+o.h*(1-math.abs(closest-center)/(o.w/2))
+                    if y<peak-0.5 and y+SIZE>o.y+0.5 then die() return end
+                else
+                    local top=o.y+o.h
+                    if vy<=0 and oldY>=top-0.01 and y<=top then
+                        y=top vy=0 grounded=true
+                    elseif y<top-0.01 and y+SIZE>o.y+0.01 then die() return end
+                end
+            end
+            if grounded then rotation=math.round(rotation/90)*90 else rotation=rotation+360*dt end
+            if x>=LENGTH then
+                x=LENGTH state="won" recordBest() updateHUD()
+                message:SetText("Level complete! 100% — press Start to play again.")
+            end
+        end
+        local function initialize()
+            if canvas then return end
+            local function frame(parent,name,color,pos,size)
+                local f=Instance.new("Frame") f.Name=name f.BackgroundColor3=color
+                f.BorderSizePixel=0 f.Position=pos f.Size=size f.Parent=parent
+                return f
+            end
+            canvas=frame(gameBox.Container,"MrHMiniGDCanvas",Color3.fromRGB(13,20,42),UDim2.fromScale(0,0),UDim2.new(1,0,0,200))
+            canvas.ClipsDescendants=true canvas.Active=true canvas.Visible=enabled
+            for i=0,8 do
+                frame(canvas,"Grid",Color3.fromRGB(24,36,63),UDim2.fromScale(i/8,0),UDim2.new(0,1,1,0))
+            end
+            frame(canvas,"Floor",Color3.fromRGB(30,63,83),UDim2.fromScale(0,144/180),UDim2.fromScale(1,36/180))
+            frame(canvas,"FloorEdge",Color3.fromRGB(90,210,230),UDim2.fromScale(0,144/180),UDim2.new(1,0,0,2))
+            local track=frame(canvas,"ProgressTrack",Color3.fromRGB(35,47,69),UDim2.fromScale(0.04,0.05),UDim2.fromScale(0.92,0.025))
+            fill=frame(track,"Progress",Color3.fromRGB(140,240,170),UDim2.fromScale(0,0),UDim2.fromScale(0,1))
+            for i,o in ipairs(level) do
+                local f=frame(canvas,o.kind,Color3.fromRGB(80,120,210),UDim2.fromScale(0,0),UDim2.fromScale(o.w/320,o.h/180))
+                if o.kind=="spike" then
+                    f.BackgroundTransparency=1
+                    for row=1,8 do
+                        local width=row/8
+                        frame(f,"SpikeSlice",Color3.fromRGB(255,100,150),UDim2.fromScale((1-width)/2,(row-1)/8),UDim2.fromScale(width,1/8))
+                    end
+                else
+                    frame(f,"Top",Color3.fromRGB(140,185,255),UDim2.fromScale(0,0),UDim2.new(1,0,0,2))
+                end
+                visuals[i]=f
+            end
+            finish=frame(canvas,"Finish",Color3.fromRGB(140,240,170),UDim2.fromScale(1,0),UDim2.fromScale(2/320,100/180))
+            cube=frame(canvas,"Cube",Color3.fromRGB(120,240,255),UDim2.fromScale(0,0),UDim2.fromScale(SIZE/320,SIZE/180))
+            for _,eyeX in ipairs({0.2,0.65}) do frame(cube,"Eye",Color3.fromRGB(12,25,40),UDim2.fromScale(eyeX,0.25),UDim2.fromScale(0.15,0.2)) end
+            frame(cube,"Mouth",Color3.fromRGB(12,25,40),UDim2.fromScale(0.2,0.65),UDim2.fromScale(0.6,0.12))
+            table.insert(signals,canvas.InputBegan:Connect(function(event)
+                if event.UserInputType==Enum.UserInputType.MouseButton1 or event.UserInputType==Enum.UserInputType.Touch then jump() end
+            end))
+            if gameBox.Resize then gameBox:Resize() end
+            draw() updateHUD()
+        end
+        buttons:AddToggle(prefix.."MiniGDVisible",{Text="Show Mini GD",Default=false,Callback=function(value)
+            enabled=value
+            if value then initialize() end
+            if canvas then canvas.Visible=value end
+            if not value and state=="playing" then state="paused" message:SetText("Paused — press Pause / Resume.") end
+            if gameBox.Resize then gameBox:Resize() end
+        end})
+        buttons:AddButton({Text="Start / Restart level",Func=function()
+            if not enabled then message:SetText("Enable Show Mini GD first.") return end
+            initialize() start()
+        end})
+        buttons:AddButton({Text="Jump",Func=jump})
+        buttons:AddButton({Text="Pause / Resume level",Func=function()
+            if state=="playing" then state="paused" buffer=0 message:SetText("Paused.")
+            elseif state=="paused" and visible() then state="playing" accumulator=0 message:SetText("Playing — tap / Space to jump.") end
+        end})
+        buttons:AddToggle(prefix.."MiniGDAutoRestart",{Text="Auto restart",Default=true,Callback=function(value) autoRestart=value end})
+        actionService:BindActionAtPriority(actionName,function(_,eventState)
+            if disposed or not ownsInput() or inputService:GetFocusedTextBox() then return Enum.ContextActionResult.Pass end
+            if eventState==Enum.UserInputState.Begin then jump() end
+            return Enum.ContextActionResult.Sink
+        end,false,3100,Enum.KeyCode.Space)
+        miniGDInputActive=ownsInput
+        table.insert(signals,Services.RunService.Heartbeat:Connect(function(dt)
+            if disposed then return end
+            if not visible() then
+                accumulator=0
+                if state=="playing" then state="paused" buffer=0 message:SetText("Paused — return and press Resume.") end
+                return
+            end
+            if state=="dead" and autoRestart then
+                retryTime=retryTime-math.min(dt,0.1)
+                if retryTime<=0 then start() end
+            end
+            if state=="playing" then
+                accumulator=accumulator+math.min(dt,1/15)
+                while accumulator>=STEP and state=="playing" do physics(STEP) accumulator=accumulator-STEP end
+                hudTime=hudTime+dt
+                if hudTime>=0.1 then hudTime=0 recordBest() updateHUD() end
+                draw()
+            end
+        end))
+        return function()
+            if disposed then return end
+            disposed=true miniGDInputActive=nil
+            for _,signal in ipairs(signals) do signal:Disconnect() end
+            actionService:UnbindAction(actionName)
+            if canvas then canvas:Destroy() end
+        end
+    end)()
+
     local function cleanupSnake()
         if disposed then return end
         disposed=true running=false
         cleanupStillwater()
+        cleanupMiniGD()
         heartbeat:Disconnect()
         actions:UnbindAction(actionName)
         if not tab.Destroyed then tab:Destroy() end
