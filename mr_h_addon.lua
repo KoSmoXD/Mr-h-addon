@@ -36,7 +36,7 @@ local Info, Variables, prefix, loaded = {}, {}, "", false
 
 Info.AddonName = 'MrHAddon'
 Info.AddonTitle = "Mr H addon"
-Info.AddonVersion = '1.1.3'
+Info.AddonVersion = '1.1.4'
 
 Info.AddonFullTitle = `{Info.AddonTitle} ({Info.AddonVersion})`
 
@@ -6534,7 +6534,21 @@ if game.GameId == 2440500124 then
             end
             return false
         end
+        local function isGoldPickup(prompt)
+            local object=prompt
+            for _=1,7 do
+                if not object or object==workspace or object==CurrentRooms or object==Drops or object==Misc then break end
+                local name=normalize(object.Name)
+                if name=="gold" or name=="goldpile" or name=="goldpickup" or name=="goldobtain"
+                    or name=="goldprompt" or name:match("^goldpile%d+$")
+                    or object:GetAttribute("GoldValue")~=nil then return true end
+                object=object.Parent
+            end
+            local label=normalize(prompt.ObjectText)
+            return label=="gold" or label=="goldpile" or label:match("^%d+gold$")~=nil or label:match("^gold%d+$")~=nil
+        end
         local function classify(prompt)
+            if isGoldPickup(prompt) then return nil end
             local action=normalize(prompt.ActionText)
             local text=chain(prompt).." "..normalize(prompt.ObjectText)
             if contains(action,{"buy","purchase","revive","eat","consume","drink","drop","donate","trade","sell"}) then return nil end
