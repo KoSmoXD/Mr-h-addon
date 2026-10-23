@@ -36,7 +36,7 @@ local Info, Variables, prefix, loaded = {}, {}, "", false
 
 Info.AddonName = 'MrHAddon'
 Info.AddonTitle = "Mr H addon"
-Info.AddonVersion = '1.1.7'
+Info.AddonVersion = '1.1.8'
 
 Info.AddonFullTitle = `{Info.AddonTitle} ({Info.AddonVersion})`
 
@@ -6559,11 +6559,11 @@ if game.GameId == 2440500124 then
             if prompt:GetAttribute("Opened")==true then return nil end
             if contains(action,{"unlock","enter","talk","hide","use","equip","activate","start","insert","close"}) then return nil end
             if not inScope(prompt) then return nil end
+            if (contains(action,{"open","search"}) or prompt.Name=="ActivateEventPrompt") and contains(text,{"drawer","container","chest","cabinet"}) then return nil end
             local pickup=contains(action,{"take","collect","pickup","grab","pick"})
             if contains(text,{"candy","candies","sweet"}) and (pickup or prompt.Name=="ModulePrompt") then return "candy" end
             if contains(text,{"junk","scrap","trash"}) and (pickup or prompt.Name=="ModulePrompt") then return "junk" end
             if contains(text,{"keyobtain","keypickup","roomkey"}) or ((pickup or prompt.Name=="ModulePrompt") and text:match("%f[%a]key%f[%A]")) then return "key" end
-            if (contains(action,{"open","search"}) or prompt.Name=="ActivateEventPrompt") and contains(text,{"drawer","container","chest","cabinet"}) then return "container" end
             if pickup or (prompt.Name=="ModulePrompt" and (action=="" or action=="interact")) then return "item" end
             return nil
         end
@@ -6698,7 +6698,7 @@ if game.GameId == 2440500124 then
             end
         end
         local function wants(kind)
-            if kind=="key" or kind=="item" or kind=="container" then return switches.items and switches.items.Value end
+            if kind=="key" or kind=="item" then return switches.items and switches.items.Value end
             if kind=="candy" then return (switches.candy and switches.candy.Value) or (switches.cauldron and switches.cauldron.Value) end
             if kind=="junk" then return switches.cauldron and switches.cauldron.Value end
             return false
@@ -6731,7 +6731,7 @@ if game.GameId == 2440500124 then
                 if kind=="cauldron" then
                     if not deposit or distance<deposit.distance then deposit=candidate end
                 else
-                    local rank=kind=="key" and 0 or kind=="container" and 2 or 1
+                    local rank=kind=="key" and 0 or 1
                     candidate.rank=rank
                     if not chosen or rank<chosen.rank or (rank==chosen.rank and distance<chosen.distance) then chosen=candidate end
                 end
@@ -6848,7 +6848,7 @@ if game.GameId == 2440500124 then
         end
         local specs={
             {"cauldron","Auto Cauldron","Collects junk and candies, then takes them to the cauldron. Junk collection is included in this toggle."},
-            {"items","Auto Take Keys / Items","Visits pickup prompts and opens containers throughout the loaded house."},
+            {"items","Auto Take Keys / Items","Collects keys and items. Use Bring Drawers and Auto Loot for drawers; this toggle does not teleport to open containers."},
             {"candy","Auto Collect Candies","Collects candy pickup prompts; never eats inventory candy."},
         }
         for _,spec in ipairs(specs) do
