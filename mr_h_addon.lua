@@ -36,7 +36,7 @@ local Info, Variables, prefix, loaded = {}, {}, "", false
 
 Info.AddonName = 'MrHAddon'
 Info.AddonTitle = "Mr H addon"
-Info.AddonVersion = '1.1.0'
+Info.AddonVersion = '1.1.1'
 
 Info.AddonFullTitle = `{Info.AddonTitle} ({Info.AddonVersion})`
 
@@ -6623,7 +6623,7 @@ if game.GameId == 2440500124 then
         local function wants(kind)
             if kind=="key" or kind=="item" or kind=="container" then return switches.items and switches.items.Value end
             if kind=="candy" then return (switches.candy and switches.candy.Value) or (switches.cauldron and switches.cauldron.Value) end
-            if kind=="junk" then return (switches.junk and switches.junk.Value) or (switches.cauldron and switches.cauldron.Value) end
+            if kind=="junk" then return switches.cauldron and switches.cauldron.Value end
             return false
         end
         local function ready(object,now)
@@ -6742,9 +6742,8 @@ if game.GameId == 2440500124 then
             sync()
         end
         local specs={
-            {"cauldron","Auto Cauldron","Collects candy/junk, then visits a live cauldron deposit or touch interaction."},
+            {"cauldron","Auto Cauldron","Collects junk and candies, then takes them to the cauldron. Junk collection is included in this toggle."},
             {"items","Auto Take Keys / Items","Visits pickup prompts and opens containers throughout the loaded house."},
-            {"junk","Auto Collect Junk","Collects junk/scrap pickup prompts."},
             {"candy","Auto Collect Candies","Collects candy pickup prompts; never eats inventory candy."},
         }
         for _,spec in ipairs(specs) do
