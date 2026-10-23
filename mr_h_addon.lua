@@ -36,7 +36,7 @@ local Info, Variables, prefix, loaded = {}, {}, "", false
 
 Info.AddonName = 'MrHAddon'
 Info.AddonTitle = "Mr H addon"
-Info.AddonVersion = '1.1.4'
+Info.AddonVersion = '1.1.5'
 
 Info.AddonFullTitle = `{Info.AddonTitle} ({Info.AddonVersion})`
 
@@ -6772,36 +6772,63 @@ if game.GameId == 2440500124 then
             if MrHShouldPauseAutoFloor() then pending=nil status("paused for an entity (Safe mode)") return end
             if pending then
                 local t=pending
-                if not usable(t.object,t.mode) or t.epoch~=state.epoch
+                if t.epoch~=state.epoch
                     or (t.kind=="cauldron" and not switches.cauldron.Value)
                     or (t.kind~="cauldron" and t.kind~="door" and not wants(t.kind))
                     or (t.kind=="door" and not state.route) then pending=nil return end
+                if not usable(t.object,t.mode) or (t.mode=="prompt" and t.object:GetAttribute("Opened")==true) then
+                    pending=nil
+                    if t.attempts and t.kind~="door" and t.kind~="cauldron" then
+                        batch=batch+1
+                        status("pickup changed: "..t.kind)
+                    end
+                    return
+                end
                 if now<t.at then return end
-                pending=nil
+                if t.attempts and t.attempts>=3 then
+                    retries[t.object]={count=0,next=now+5}
+                    pending=nil
+                    status("pickup did not respond; retrying later (inventory may be full)")
+                    return
+                end
                 local _,targetFrame=partFor(t.object)
-                if not targetFrame then return end
+                if not targetFrame then pending=nil return end
                 local reach=t.mode=="prompt" and math.max(4,t.object.MaxActivationDistance) or 6
-                if (root.Position-targetFrame.Position).Magnitude>reach then status("teleport corrected; target not in reach") return end
+                if (root.Position-targetFrame.Position).Magnitude>reach then
+                    heldFrame=targetFrame*CFrame.new(0,t.mode=="touch" and 0 or 1.5,0)
+                    t.at=now+0.35 t.corrections=(t.corrections or 0)+1
+                    if t.corrections>=3 then retries[t.object]={count=0,next=now+5} pending=nil end
+                    status("repositioning for pickup") return
+                end
                 if t.kind=="door" then equipKey(character,humanoid) end
                 local targetName=t.object.Parent and t.object.Parent.Name or t.object.Name
                 if t.mode=="prompt" then fireproximityprompt(t.object,t.object.HoldDuration)
                 elseif t.mode=="touch" and firetouchinterest then firetouchinterest(root,t.part,0) firetouchinterest(root,t.part,1)
                 end
                 if t.epoch~=state.epoch or not state.running then return end
-                if t.kind=="cauldron" then lastDeposit=now batch=0
-                elseif t.kind~="door" then batch=batch+1 end
-                status("interacted: "..t.kind.." / "..targetName)
+                if t.kind=="cauldron" then
+                    lastDeposit=now batch=0 pending=nil
+                elseif t.kind=="door" then
+                    pending=nil
+                else
+                    t.attempts=(t.attempts or 0)+1
+                    t.at=now+math.max(0.65,t.mode=="prompt" and t.object.HoldDuration or 0)
+                    if not usable(t.object,t.mode) or t.object:GetAttribute("Opened")==true then
+                        batch=batch+1 pending=nil
+                    end
+                end
+                status(pending and ("waiting for pickup: "..targetName) or ("interaction finished: "..t.kind.." / "..targetName))
                 return
             end
             local target,lootCount=findTarget(root,now)
             if not target and state.route and lootCount==0 then target=doorTarget(root,now) end
-            if not target and lootCount>0 then status("waiting for pickup retry / inventory space (up to 15 seconds)") return end
+            if not target and lootCount>0 then status("waiting for pickup retry / inventory space (up to 5 seconds)") return end
             if not target then
                 status(state.route and "no verified pickup/door prompt; waiting for streamed room objects" or "waiting for pickups or an active cauldron prompt/touch trigger")
                 return
             end
             local r=retries[target.object] or {count=0,next=0}
-            r.count=r.count+1 r.next=now+(r.count>=3 and 15 or 0.8)
+            r.count=r.count+1 r.next=now+(r.count>=3 and 5 or 0.8)
             if r.count>=3 then r.count=0 end
             retries[target.object]=r
             local doorReach=Library.Toggles.DoorReach
@@ -6810,7 +6837,7 @@ if game.GameId == 2440500124 then
             heldFrame=target.frame*CFrame.new(0,target.mode=="touch" and 0 or 1.5,0)
             maintainTeleport()
             root.AssemblyLinearVelocity=Vector3.zero root.AssemblyAngularVelocity=Vector3.zero
-            target.at=now+0.2 target.epoch=state.epoch pending=target
+            target.at=now+0.35 target.epoch=state.epoch pending=target
             status("moving to "..target.kind.." / "..target.object.Parent.Name)
         end
         local function enableAux()
