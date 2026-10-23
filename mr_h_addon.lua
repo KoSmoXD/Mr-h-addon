@@ -36,7 +36,7 @@ local Info, Variables, prefix, loaded = {}, {}, "", false
 
 Info.AddonName = 'MrHAddon'
 Info.AddonTitle = "Mr H addon"
-Info.AddonVersion = '1.1.2'
+Info.AddonVersion = '1.1.3'
 
 Info.AddonFullTitle = `{Info.AddonTitle} ({Info.AddonVersion})`
 
@@ -6497,6 +6497,8 @@ if game.GameId == 2440500124 then
         local state={floor=false,disposed=false,running=false,route=false,epoch=0,busy=false}
         local savedToggles,hookedFunctions={},{}
         local connectHook=nil
+        local heldFrame,slideCharacter=nil,nil
+        local previousSlide=nil
         local requirements={"fireproximityprompt","getconnections","hookfunction","restorefunction","isfunctionhooked","checkcaller"}
         local function missingSupport()
             local available={fireproximityprompt,getconnections,hookfunction,restorefunction,isfunctionhooked,checkcaller}
@@ -6579,6 +6581,16 @@ if game.GameId == 2440500124 then
         end
         local function stopMovement()
             state.epoch=state.epoch+1 state.running=false pending=nil
+            heldFrame=nil slideCharacter=nil
+            if previousSlide~=nil then
+                local keepSlide=previousSlide or (Toggles.SlideSpeedHack~=nil and Toggles.SlideSpeedHack.Value==true)
+                Variables.slideSH=keepSlide
+                previousSlide=nil
+                pcall(function()
+                    local character=LocalPlayer.Character
+                    if character then Crouch:FireServer(character:GetAttribute("Crouching")==true,keepSlide) end
+                end)
+            end
             if connectHook then
                 pcall(function() if isfunctionhooked(connectHook) then restorefunction(connectHook) end end)
                 connectHook=nil
@@ -6613,6 +6625,8 @@ if game.GameId == 2440500124 then
                 end
             end
             state.epoch=state.epoch+1 state.running=true pending=nil
+            previousSlide=Variables.slideSH==true
+            slideCharacter=nil heldFrame=nil
             local ok,reason=pcall(function()
                 protectCallback(getTpFunction())
                 -- Match tplay's replacement-listener handling, scoped to this event.
@@ -6645,6 +6659,29 @@ if game.GameId == 2440500124 then
             local humanoid=character and character:FindFirstChildWhichIsA("Humanoid")
             if not root or not humanoid or humanoid.Health<=0 or root.Anchored then return nil end
             return character,root,humanoid
+        end
+        local function maintainTeleport()
+            if not state.running then return end
+            local character,root=currentCharacter()
+            if not character then heldFrame=nil slideCharacter=nil return end
+            if MrHShouldPauseAutoFloor() then return end
+            -- tplay Auto Floor's slide handshake must precede the first pivot.
+            -- Reapply on respawn or if another control resets the slide state.
+            if not Variables.slideSH or slideCharacter~=character then
+                Crouch:FireServer(true,true)
+                Variables.slideSH=true
+                slideCharacter=character
+            elseif not Variables.hook then
+                -- Same fallback as tplay Slide Bypass without the namecall hook.
+                Crouch:FireServer(true,true)
+            end
+            -- tplay pins its current target on Heartbeat, not once per interaction.
+            -- Keep the destination after pickup disappears; never return to origin.
+            if heldFrame then
+                MrHAutoFloorPivot(heldFrame)
+                root.AssemblyLinearVelocity=Vector3.zero
+                root.AssemblyAngularVelocity=Vector3.zero
+            end
         end
         local function wants(kind)
             if kind=="key" or kind=="item" or kind=="container" then return switches.items and switches.items.Value end
@@ -6756,7 +6793,8 @@ if game.GameId == 2440500124 then
             local doorReach=Library.Toggles.DoorReach
             if doorReach.Value~=(target.mode=="doorReach") then doorReach:SetValue(target.mode=="doorReach") end
             if target.kind=="door" then equipKey(character,humanoid) end
-            MrHAutoFloorPivot(target.frame*CFrame.new(0,target.mode=="touch" and 0 or 1.5,0))
+            heldFrame=target.frame*CFrame.new(0,target.mode=="touch" and 0 or 1.5,0)
+            maintainTeleport()
             root.AssemblyLinearVelocity=Vector3.zero root.AssemblyAngularVelocity=Vector3.zero
             target.at=now+0.2 target.epoch=state.epoch pending=target
             status("moving to "..target.kind.." / "..target.object.Parent.Name)
@@ -6829,10 +6867,18 @@ if game.GameId == 2440500124 then
         end
         table.insert(signals,workspace.DescendantAdded:Connect(function(object) if state.running then observe(object) end end))
         table.insert(signals,workspace.DescendantRemoving:Connect(function(object) cache[object]=nil retries[object]=nil end))
-        table.insert(signals,LocalPlayer.CharacterAdded:Connect(function() pending=nil retries={} end))
+        table.insert(signals,LocalPlayer.CharacterAdded:Connect(function() pending=nil retries={} heldFrame=nil slideCharacter=nil end))
         local elapsed=0
         table.insert(signals,Services.RunService.Heartbeat:Connect(function(dt)
             if state.disposed then return end
+            if state.running then
+                local ok,reason=pcall(maintainTeleport)
+                if not ok then
+                    stopMovement()
+                    status("teleport failed: "..tostring(reason))
+                    return
+                end
+            end
             elapsed=elapsed+dt clock=clock+dt
             if elapsed<0.15 or state.busy then return end
             elapsed=0
