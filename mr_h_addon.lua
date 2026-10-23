@@ -36,7 +36,7 @@ local Info, Variables, prefix, loaded = {}, {}, "", false
 
 Info.AddonName = 'MrHAddon'
 Info.AddonTitle = "Mr H addon"
-Info.AddonVersion = '1.1.1'
+Info.AddonVersion = '1.1.2'
 
 Info.AddonFullTitle = `{Info.AddonTitle} ({Info.AddonVersion})`
 
@@ -6495,7 +6495,13 @@ if game.GameId == 2440500124 then
         box:AddLabel("Vault test build. If a target is missed, use Copy Vault Diagnostics to report its live prompt names.",true)
         local switches,signals,cache,retries={},{},{},{}
         local state={floor=false,disposed=false,running=false,route=false,epoch=0,busy=false}
-        local savedToggles,hookedFunction={},nil
+        local savedToggles,hookedFunctions={},{}
+        local connectHook=nil
+        local requirements={"fireproximityprompt","getconnections","hookfunction","restorefunction","isfunctionhooked","checkcaller"}
+        local function missingSupport()
+            local available={fireproximityprompt,getconnections,hookfunction,restorefunction,isfunctionhooked,checkcaller}
+            for i,name in ipairs(requirements) do if type(available[i])~="function" then return name end end
+        end
         local pending,lastDeposit,batch,clock=nil,-math.huge,0,0
         local lastStatus=""
         local function status(text)
@@ -6573,17 +6579,31 @@ if game.GameId == 2440500124 then
         end
         local function stopMovement()
             state.epoch=state.epoch+1 state.running=false pending=nil
-            if hookedFunction and isfunctionhooked and restorefunction then
-                pcall(function() if isfunctionhooked(hookedFunction) then restorefunction(hookedFunction) end end)
+            if connectHook then
+                pcall(function() if isfunctionhooked(connectHook) then restorefunction(connectHook) end end)
+                connectHook=nil
             end
-            hookedFunction=nil
+            for fn in pairs(hookedFunctions) do
+                pcall(function() if isfunctionhooked(fn) then restorefunction(fn) end end)
+            end
+            hookedFunctions={}
             for toggle,previous in pairs(savedToggles) do
                 pcall(function() toggle:SetDisabled(previous.disabled) toggle:SetValue(previous.value) end)
             end
             savedToggles={} mrhReleasePause()
         end
+        local function protectCallback(fn)
+            if type(fn)~="function" or hookedFunctions[fn] or isfunctionhooked(fn) then return end
+            local original
+            original=hookfunction(fn,function(...)
+                if checkcaller() or not state.running then return original(...) end
+            end)
+            hookedFunctions[fn]=true
+        end
         local function beginMovement()
             if state.running then return end
+            local missing=missingSupport()
+            if missing then status("executor missing "..missing) return end
             -- Same anti-teleport preparation as tplay Auto Floor, owned and restored here.
             for _,toggle in pairs({Toggles.AntiTeleport,Toggles.AntiTeleportRaknet,Library.Toggles.DoorReach}) do
                 if toggle and type(toggle.SetDisabled)=="function" then
@@ -6592,19 +6612,25 @@ if game.GameId == 2440500124 then
                     toggle:SetDisabled(true)
                 end
             end
-            if hookfunction and restorefunction and isfunctionhooked then
-                local ok,fn=pcall(getTpFunction)
-                if ok and type(fn)=="function" and not isfunctionhooked(fn) then
-                    local original
-                    local installed=pcall(function()
-                        original=hookfunction(fn,function(...)
-                            if checkcaller and checkcaller() then return original(...) end
-                        end)
-                    end)
-                    if installed then hookedFunction=fn end
-                end
-            end
             state.epoch=state.epoch+1 state.running=true pending=nil
+            local ok,reason=pcall(function()
+                protectCallback(getTpFunction())
+                -- Match tplay's replacement-listener handling, scoped to this event.
+                local event=ServerTeleported.OnClientEvent
+                local connect=event.Connect
+                if isfunctionhooked(connect) then error("teleport connection hook is already in use") end
+                local originalConnect
+                originalConnect=hookfunction(connect,function(self,fn,...)
+                    if self==event and state.running and not checkcaller() then protectCallback(fn) end
+                    return originalConnect(self,fn,...)
+                end)
+                connectHook=connect
+            end)
+            if not ok then
+                stopMovement()
+                status("teleport setup failed: "..tostring(reason))
+                return
+            end
             batch=0 lastDeposit=-math.huge retries={}
             scan()
         end
@@ -6749,7 +6775,7 @@ if game.GameId == 2440500124 then
         for _,spec in ipairs(specs) do
             switches[spec[1]]=box:AddToggle(prefix.."Vault_"..spec[1],{
                 Text=spec[2],Tooltip=spec[3],Default=false,Disabled=true,
-                DisabledTooltip="Enter Candy Vault; fireproximityprompt is required.",Callback=enableAux,
+                DisabledTooltip="Enter Candy Vault with an executor supporting tplay Auto Floor hooks.",Callback=enableAux,
             })
         end
         box:AddButton({Text="Rescan Vault Items",Func=function()
@@ -6758,25 +6784,31 @@ if game.GameId == 2440500124 then
         end})
         box:AddButton({Text="Copy Vault Diagnostics",Func=function()
             scan()
-            local lines={"Mr H Candy Vault diagnostics","Floor: "..tostring(Floor).." / "..tostring(FloorSpecific),"Status: "..lastStatus}
-            local count=0
+            local lines={"Mr H Candy Vault diagnostics","Floor: "..tostring(Floor).." / "..tostring(FloorSpecific),"Status: "..lastStatus,"Missing executor function: "..tostring(missingSupport()),"Running: "..tostring(state.running)}
+            local count,unrecognized=0,{}
             for object,mode in pairs(cache) do
                 if not object.Parent then continue end
                 local kind=mode=="touch" and "cauldron" or classify(object)
-                if not kind then continue end
+                if not kind then
+                    if mode=="prompt" and inScope(object) and #unrecognized<80 then
+                        unrecognized[#unrecognized+1]="unrecognized | "..object:GetFullName().." | "..object.ActionText.." | "..object.ObjectText.." | enabled="..tostring(object.Enabled)
+                    end
+                    continue
+                end
                 count=count+1
                 if count<=40 then lines[#lines+1]=kind.." | "..object:GetFullName()..(mode=="prompt" and (" | "..object.ActionText.." | "..object.ObjectText) or " | touch") end
             end
             lines[#lines+1]="Recognized targets: "..count
+            for _,line in ipairs(unrecognized) do lines[#lines+1]=line end
             local text=table.concat(lines,"\n")
             local copy=setclipboard or toclipboard
             if type(copy)=="function" then copy(text) status("diagnostics copied") else print(text) status("diagnostics printed to console") end
         end})
-        local vaultEntry={Requirements={"fireproximityprompt"},Callback=function(value) state.route=value sync() end}
+        local vaultEntry={Requirements=requirements,Callback=function(value) state.route=value sync() end}
         local function refresh()
             local detected=isVault()
             if detected~=state.floor then state.floor=detected end
-            for _,toggle in pairs(switches) do toggle:SetDisabled(not (detected and type(fireproximityprompt)=="function")) end
+            for _,toggle in pairs(switches) do toggle:SetDisabled(not (detected and not missingSupport())) end
             if detected then
                 if Toggles.AutoFloor and Toggles.AutoFloor.Value and not state.route and Variables.AutoFloorFunc~=vaultEntry then
                     Toggles.AutoFloor:SetValue(false)
@@ -6784,10 +6816,13 @@ if game.GameId == 2440500124 then
                 Variables.AutoFloors[Floor]=vaultEntry
                 if Toggles.AutoFloor and not state.running then
                     Variables.AutoFloorFunc=Variables.AutoFloors[Floor]
-                    Variables.AutoFloorSupported=type(fireproximityprompt)=="function"
+                    Variables.AutoFloorSupported=not missingSupport()
                     Toggles.AutoFloor:SetDisabled(not Variables.AutoFloorSupported)
                 end
-                if not state.running then status("ready — enable collection or Auto Floor") end
+                if not state.running then
+                    local missing=missingSupport()
+                    status(missing and ("executor missing "..missing) or "ready — enable collection or Auto Floor")
+                end
             elseif state.running then stopMovement() status("not in Candy Vault")
             else status("not in Candy Vault") end
             sync()
