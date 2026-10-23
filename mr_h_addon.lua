@@ -36,7 +36,7 @@ local Info, Variables, prefix, loaded = {}, {}, "", false
 
 Info.AddonName = 'MrHAddon'
 Info.AddonTitle = "Mr H addon"
-Info.AddonVersion = '1.0.0'
+Info.AddonVersion = '1.1.0'
 
 Info.AddonFullTitle = `{Info.AddonTitle} ({Info.AddonVersion})`
 
@@ -6485,6 +6485,340 @@ if game.GameId == 2440500124 then
 			end
 		},
 	}
+
+    -- Candy Vault integration. Uses tplay's teleport helper and the live game's prompts.
+    -- Prompt names/remote payloads are not present in the showcase; no remote payloads are guessed.
+    Variables.MrHVault = (function()
+        local box=Groupbox2 or Groupbox
+        box:AddDivider({Text="CANDY VAULT",MarginTop=8,MarginBottom=0})
+        local label=box:AddLabel("Candy Vault: checking floor...",true)
+        box:AddLabel("Vault test build. If a target is missed, use Copy Vault Diagnostics to report its live prompt names.",true)
+        local switches,signals,cache,retries={},{},{},{}
+        local state={floor=false,disposed=false,running=false,route=false,epoch=0,busy=false}
+        local savedToggles,hookedFunction={},nil
+        local pending,lastDeposit,batch,clock=nil,-math.huge,0,0
+        local lastStatus=""
+        local function status(text)
+            if text~=lastStatus then lastStatus=text label:SetText("Candy Vault: "..text) end
+        end
+        local function normalize(text) return tostring(text or ""):lower():gsub("[^%w]","") end
+        local function contains(text,terms)
+            for _,term in ipairs(terms) do if text:find(term,1,true) then return true end end
+            return false
+        end
+        local function chain(object)
+            local names={}
+            local current=object
+            for _=1,7 do
+                if not current or current==workspace or current==CurrentRooms or current==Drops or current==Misc then break end
+                names[#names+1]=normalize(current.Name)
+                current=current.Parent
+            end
+            return table.concat(names," ")
+        end
+        local function inScope(object)
+            return object:IsDescendantOf(CurrentRooms) or object:IsDescendantOf(Drops) or object:IsDescendantOf(Misc)
+        end
+        local function isVault()
+            if contains(normalize(Floor).." "..normalize(FloorSpecific),{"candyvault","thevault"}) or normalize(Floor)=="vault" then return true end
+            for _,room in ipairs(CurrentRooms:GetChildren()) do
+                if tostring(room:GetAttribute("RawName") or ""):lower():match("^vault_") then return true end
+            end
+            return false
+        end
+        local function classify(prompt)
+            local action=normalize(prompt.ActionText)
+            local text=chain(prompt).." "..normalize(prompt.ObjectText)
+            if contains(action,{"buy","purchase","revive","eat","consume","drink","drop","donate","trade","sell"}) then return nil end
+            if contains(text,{"cauldron"}) then
+                if contains(action,{"deposit","add","fill","offer","feed","put","collect","take","use"}) or prompt.Name=="ModulePrompt" then return "cauldron" end
+                return nil
+            end
+            if prompt:GetAttribute("Opened")==true then return nil end
+            if contains(action,{"unlock","enter","talk","hide","use","equip","activate","start","insert","close"}) then return nil end
+            if not inScope(prompt) then return nil end
+            local pickup=contains(action,{"take","collect","pickup","grab","pick"})
+            if contains(text,{"candy","candies","sweet"}) and (pickup or prompt.Name=="ModulePrompt") then return "candy" end
+            if contains(text,{"junk","scrap","trash"}) and (pickup or prompt.Name=="ModulePrompt") then return "junk" end
+            if contains(text,{"keyobtain","keypickup","roomkey"}) or ((pickup or prompt.Name=="ModulePrompt") and text:match("%f[%a]key%f[%A]")) then return "key" end
+            if (contains(action,{"open","search"}) or prompt.Name=="ActivateEventPrompt") and contains(text,{"drawer","container","chest","cabinet"}) then return "container" end
+            if pickup or (prompt.Name=="ModulePrompt" and (action=="" or action=="interact")) then return "item" end
+            return nil
+        end
+        local function partFor(object)
+            local parent=object
+            for _=1,8 do
+                if not parent or parent==workspace then return nil end
+                if parent:IsA("Attachment") and parent.Parent and parent.Parent:IsA("BasePart") then return parent.Parent,parent.WorldCFrame end
+                if parent:IsA("BasePart") then return parent,parent.CFrame end
+                if parent:IsA("Model") then
+                    local part=parent.PrimaryPart or parent:FindFirstChildWhichIsA("BasePart",true)
+                    if part then return part,part.CFrame end
+                end
+                parent=parent.Parent
+            end
+            return nil
+        end
+        local function observe(object)
+            if object:IsA("ProximityPrompt") then cache[object]="prompt"
+            elseif object:IsA("TouchTransmitter") and object.Parent and object.Parent:IsA("BasePart") and chain(object):find("cauldron",1,true) then cache[object.Parent]="touch" end
+        end
+        local function scan()
+            for _,object in ipairs(workspace:GetDescendants()) do observe(object) end
+        end
+        local function requested()
+            if state.route then return true end
+            for _,toggle in pairs(switches) do if toggle.Value then return true end end
+            return false
+        end
+        local function stopMovement()
+            state.epoch=state.epoch+1 state.running=false pending=nil
+            if hookedFunction and isfunctionhooked and restorefunction then
+                pcall(function() if isfunctionhooked(hookedFunction) then restorefunction(hookedFunction) end end)
+            end
+            hookedFunction=nil
+            for toggle,previous in pairs(savedToggles) do
+                pcall(function() toggle:SetDisabled(previous.disabled) toggle:SetValue(previous.value) end)
+            end
+            savedToggles={} mrhReleasePause()
+        end
+        local function beginMovement()
+            if state.running then return end
+            -- Same anti-teleport preparation as tplay Auto Floor, owned and restored here.
+            for _,toggle in pairs({Toggles.AntiTeleport,Toggles.AntiTeleportRaknet,Library.Toggles.DoorReach}) do
+                if toggle and type(toggle.SetDisabled)=="function" then
+                    savedToggles[toggle]={value=toggle.Value,disabled=toggle.Disabled==true}
+                    if toggle.Value then toggle:SetValue(false) end
+                    toggle:SetDisabled(true)
+                end
+            end
+            if hookfunction and restorefunction and isfunctionhooked then
+                local ok,fn=pcall(getTpFunction)
+                if ok and type(fn)=="function" and not isfunctionhooked(fn) then
+                    local original
+                    local installed=pcall(function()
+                        original=hookfunction(fn,function(...)
+                            if checkcaller and checkcaller() then return original(...) end
+                        end)
+                    end)
+                    if installed then hookedFunction=fn end
+                end
+            end
+            state.epoch=state.epoch+1 state.running=true pending=nil
+            batch=0 lastDeposit=-math.huge retries={}
+            scan()
+        end
+        local function sync()
+            if state.disposed then return end
+            if state.floor and requested() then beginMovement()
+            elseif state.running then stopMovement() end
+        end
+        local function currentCharacter()
+            local character=LocalPlayer.Character
+            local root=character and character:FindFirstChild("HumanoidRootPart")
+            local humanoid=character and character:FindFirstChildWhichIsA("Humanoid")
+            if not root or not humanoid or humanoid.Health<=0 or root.Anchored then return nil end
+            return character,root,humanoid
+        end
+        local function wants(kind)
+            if kind=="key" or kind=="item" or kind=="container" then return switches.items and switches.items.Value end
+            if kind=="candy" then return (switches.candy and switches.candy.Value) or (switches.cauldron and switches.cauldron.Value) end
+            if kind=="junk" then return (switches.junk and switches.junk.Value) or (switches.cauldron and switches.cauldron.Value) end
+            return false
+        end
+        local function ready(object,now)
+            local r=retries[object]
+            return not r or now>=r.next
+        end
+        local function usable(object,mode)
+            if not object.Parent or not object:IsDescendantOf(workspace) then return false end
+            if object:IsDescendantOf(LocalPlayer.Character or workspace.Terrain) then return false end
+            return mode~="prompt" or object.Enabled
+        end
+        local function findTarget(root,now)
+            local chosen,deposit,lootCount=nil,nil,0
+            for object,mode in pairs(cache) do
+                if not object.Parent then cache[object]=nil retries[object]=nil continue end
+                if not usable(object,mode) then continue end
+                local kind=mode=="touch" and "cauldron" or classify(object)
+                if not kind then continue end
+                if kind=="cauldron" and not (switches.cauldron and switches.cauldron.Value) then continue end
+                if kind~="cauldron" and not wants(kind) then continue end
+                local part,frame=partFor(object)
+                if not part then continue end
+                local distance=(root.Position-frame.Position).Magnitude
+                if distance>2000 then continue end
+                if kind~="cauldron" then lootCount=lootCount+1 end
+                if not ready(object,now) then continue end
+                local candidate={object=object,mode=mode,kind=kind,frame=frame,part=part,distance=distance}
+                if kind=="cauldron" then
+                    if not deposit or distance<deposit.distance then deposit=candidate end
+                else
+                    local rank=kind=="key" and 0 or kind=="container" and 2 or 1
+                    candidate.rank=rank
+                    if not chosen or rank<chosen.rank or (rank==chosen.rank and distance<chosen.distance) then chosen=candidate end
+                end
+            end
+            if deposit and now-lastDeposit>=8 and (batch>=8 or not chosen) then return deposit,lootCount end
+            return chosen,lootCount
+        end
+        local function doorTarget(root,now)
+            local room=CurrentRooms:FindFirstChild(tostring(LatestRoom.Value))
+            local door=room and room:FindFirstChild("Door")
+            if not door then return nil end
+            for _,prompt in ipairs(door:GetDescendants()) do
+                if not prompt:IsA("ProximityPrompt") or not prompt.Enabled or not ready(prompt,now) then continue end
+                local action=normalize(prompt.ActionText).." "..normalize(prompt.Name)
+                if contains(action,{"unlock","open","enter"}) then
+                    local part,frame=partFor(prompt)
+                    if part then return {object=prompt,mode="prompt",kind="door",frame=frame,part=part,distance=(frame.Position-root.Position).Magnitude} end
+                end
+            end
+            if ready(door,now) then
+                local part,frame=partFor(door)
+                if part then return {object=door,mode="doorReach",kind="door",frame=frame,part=part} end
+            end
+            return nil
+        end
+        local function equipKey(character,humanoid)
+            local backpack=LocalPlayer:FindFirstChild("Backpack")
+            if not backpack then return end
+            for _,tool in ipairs(character:GetChildren()) do if tool:IsA("Tool") and normalize(tool.Name):find("key",1,true) then return end end
+            for _,tool in ipairs(backpack:GetChildren()) do
+                if tool:IsA("Tool") and normalize(tool.Name):find("key",1,true) then humanoid:EquipTool(tool) return end
+            end
+        end
+        local function advance(now)
+            if not state.running then return end
+            local character,root,humanoid=currentCharacter()
+            if not character then pending=nil status("waiting for a living, movable character") return end
+            if MrHShouldPauseAutoFloor() then pending=nil status("paused for an entity (Safe mode)") return end
+            if pending then
+                local t=pending
+                if not usable(t.object,t.mode) or t.epoch~=state.epoch
+                    or (t.kind=="cauldron" and not switches.cauldron.Value)
+                    or (t.kind~="cauldron" and t.kind~="door" and not wants(t.kind))
+                    or (t.kind=="door" and not state.route) then pending=nil return end
+                if now<t.at then return end
+                pending=nil
+                local _,targetFrame=partFor(t.object)
+                if not targetFrame then return end
+                local reach=t.mode=="prompt" and math.max(4,t.object.MaxActivationDistance) or 6
+                if (root.Position-targetFrame.Position).Magnitude>reach then status("teleport corrected; target not in reach") return end
+                if t.kind=="door" then equipKey(character,humanoid) end
+                local targetName=t.object.Parent and t.object.Parent.Name or t.object.Name
+                if t.mode=="prompt" then fireproximityprompt(t.object,t.object.HoldDuration)
+                elseif t.mode=="touch" and firetouchinterest then firetouchinterest(root,t.part,0) firetouchinterest(root,t.part,1)
+                end
+                if t.epoch~=state.epoch or not state.running then return end
+                if t.kind=="cauldron" then lastDeposit=now batch=0
+                elseif t.kind~="door" then batch=batch+1 end
+                status("interacted: "..t.kind.." / "..targetName)
+                return
+            end
+            local target,lootCount=findTarget(root,now)
+            if not target and state.route and lootCount==0 then target=doorTarget(root,now) end
+            if not target and lootCount>0 then status("waiting for pickup retry / inventory space (up to 15 seconds)") return end
+            if not target then
+                status(state.route and "no verified pickup/door prompt; waiting for streamed room objects" or "waiting for pickups or an active cauldron prompt/touch trigger")
+                return
+            end
+            local r=retries[target.object] or {count=0,next=0}
+            r.count=r.count+1 r.next=now+(r.count>=3 and 15 or 0.8)
+            if r.count>=3 then r.count=0 end
+            retries[target.object]=r
+            local doorReach=Library.Toggles.DoorReach
+            if doorReach.Value~=(target.mode=="doorReach") then doorReach:SetValue(target.mode=="doorReach") end
+            if target.kind=="door" then equipKey(character,humanoid) end
+            MrHAutoFloorPivot(target.frame*CFrame.new(0,target.mode=="touch" and 0 or 1.5,0))
+            root.AssemblyLinearVelocity=Vector3.zero root.AssemblyAngularVelocity=Vector3.zero
+            target.at=now+0.2 target.epoch=state.epoch pending=target
+            status("moving to "..target.kind.." / "..target.object.Parent.Name)
+        end
+        local function enableAux()
+            -- A single movement owner: independent collection stops ordinary tplay routing.
+            if not state.floor then status("load a Candy Vault run first") return end
+            if not state.route and Toggles.AutoFloor and Toggles.AutoFloor.Value then Toggles.AutoFloor:SetValue(false) end
+            sync()
+        end
+        local specs={
+            {"cauldron","Auto Cauldron","Collects candy/junk, then visits a live cauldron deposit or touch interaction."},
+            {"items","Auto Take Keys / Items","Visits pickup prompts and opens containers throughout the loaded house."},
+            {"junk","Auto Collect Junk","Collects junk/scrap pickup prompts."},
+            {"candy","Auto Collect Candies","Collects candy pickup prompts; never eats inventory candy."},
+        }
+        for _,spec in ipairs(specs) do
+            switches[spec[1]]=box:AddToggle(prefix.."Vault_"..spec[1],{
+                Text=spec[2],Tooltip=spec[3],Default=false,Disabled=true,
+                DisabledTooltip="Enter Candy Vault; fireproximityprompt is required.",Callback=enableAux,
+            })
+        end
+        box:AddButton({Text="Rescan Vault Items",Func=function()
+            retries={} pending=nil scan()
+            status("rescanned loaded objects")
+        end})
+        box:AddButton({Text="Copy Vault Diagnostics",Func=function()
+            scan()
+            local lines={"Mr H Candy Vault diagnostics","Floor: "..tostring(Floor).." / "..tostring(FloorSpecific),"Status: "..lastStatus}
+            local count=0
+            for object,mode in pairs(cache) do
+                if not object.Parent then continue end
+                local kind=mode=="touch" and "cauldron" or classify(object)
+                if not kind then continue end
+                count=count+1
+                if count<=40 then lines[#lines+1]=kind.." | "..object:GetFullName()..(mode=="prompt" and (" | "..object.ActionText.." | "..object.ObjectText) or " | touch") end
+            end
+            lines[#lines+1]="Recognized targets: "..count
+            local text=table.concat(lines,"\n")
+            local copy=setclipboard or toclipboard
+            if type(copy)=="function" then copy(text) status("diagnostics copied") else print(text) status("diagnostics printed to console") end
+        end})
+        local vaultEntry={Requirements={"fireproximityprompt"},Callback=function(value) state.route=value sync() end}
+        local function refresh()
+            local detected=isVault()
+            if detected~=state.floor then state.floor=detected end
+            for _,toggle in pairs(switches) do toggle:SetDisabled(not (detected and type(fireproximityprompt)=="function")) end
+            if detected then
+                if Toggles.AutoFloor and Toggles.AutoFloor.Value and not state.route and Variables.AutoFloorFunc~=vaultEntry then
+                    Toggles.AutoFloor:SetValue(false)
+                end
+                Variables.AutoFloors[Floor]=vaultEntry
+                if Toggles.AutoFloor and not state.running then
+                    Variables.AutoFloorFunc=Variables.AutoFloors[Floor]
+                    Variables.AutoFloorSupported=type(fireproximityprompt)=="function"
+                    Toggles.AutoFloor:SetDisabled(not Variables.AutoFloorSupported)
+                end
+                if not state.running then status("ready — enable collection or Auto Floor") end
+            elseif state.running then stopMovement() status("not in Candy Vault")
+            else status("not in Candy Vault") end
+            sync()
+        end
+        table.insert(signals,workspace.DescendantAdded:Connect(function(object) if state.running then observe(object) end end))
+        table.insert(signals,workspace.DescendantRemoving:Connect(function(object) cache[object]=nil retries[object]=nil end))
+        table.insert(signals,LocalPlayer.CharacterAdded:Connect(function() pending=nil retries={} end))
+        local elapsed=0
+        table.insert(signals,Services.RunService.Heartbeat:Connect(function(dt)
+            if state.disposed then return end
+            elapsed=elapsed+dt clock=clock+dt
+            if elapsed<0.15 or state.busy then return end
+            elapsed=0
+            if clock>=2 then clock=0 refresh() end
+            if not state.running then return end
+            state.busy=true
+            task.spawn(function()
+                local ok,reason=pcall(advance,os.clock())
+                state.busy=false
+                if not ok then status("interaction failed; see console") warn("[Mr H Candy Vault] "..tostring(reason)) end
+            end)
+        end))
+        OnUnload(function()
+            state.disposed=true state.route=false stopMovement()
+            for _,signal in ipairs(signals) do signal:Disconnect() end
+            cache={} retries={}
+        end)
+        refresh()
+        return {Refresh=refresh}
+    end)()
 
 	function ExecutorSupported(AutoFloor)
 		for _, funcName in AutoFloor.Requirements do
