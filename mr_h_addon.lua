@@ -36,7 +36,7 @@ local Info, Variables, prefix, loaded = {}, {}, "", false
 
 Info.AddonName = 'MrHAddon'
 Info.AddonTitle = "Mr H addon"
-Info.AddonVersion = '1.1.5'
+Info.AddonVersion = '1.1.6'
 
 Info.AddonFullTitle = `{Info.AddonTitle} ({Info.AddonVersion})`
 
@@ -6802,7 +6802,7 @@ if game.GameId == 2440500124 then
                 end
                 if t.kind=="door" then equipKey(character,humanoid) end
                 local targetName=t.object.Parent and t.object.Parent.Name or t.object.Name
-                if t.mode=="prompt" then fireproximityprompt(t.object,t.object.HoldDuration)
+                if t.mode=="prompt" then fireproximityprompt(t.object)
                 elseif t.mode=="touch" and firetouchinterest then firetouchinterest(root,t.part,0) firetouchinterest(root,t.part,1)
                 end
                 if t.epoch~=state.epoch or not state.running then return end
