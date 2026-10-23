@@ -36,7 +36,7 @@ local Info, Variables, prefix, loaded = {}, {}, "", false
 
 Info.AddonName = 'MrHAddon'
 Info.AddonTitle = "Mr H addon"
-Info.AddonVersion = '1.1.6'
+Info.AddonVersion = '1.1.7'
 
 Info.AddonFullTitle = `{Info.AddonTitle} ({Info.AddonVersion})`
 
@@ -6785,7 +6785,7 @@ if game.GameId == 2440500124 then
                     return
                 end
                 if now<t.at then return end
-                if t.attempts and t.attempts>=3 then
+                if t.attempts and t.attempts>=20 then
                     retries[t.object]={count=0,next=now+5}
                     pending=nil
                     status("pickup did not respond; retrying later (inventory may be full)")
@@ -6812,7 +6812,7 @@ if game.GameId == 2440500124 then
                     pending=nil
                 else
                     t.attempts=(t.attempts or 0)+1
-                    t.at=now+math.max(0.65,t.mode=="prompt" and t.object.HoldDuration or 0)
+                    t.at=now+0.15
                     if not usable(t.object,t.mode) or t.object:GetAttribute("Opened")==true then
                         batch=batch+1 pending=nil
                     end
