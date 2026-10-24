@@ -6679,16 +6679,12 @@ if game.GameId == 2440500124 then
             local character,root=currentCharacter()
             if not character then heldFrame=nil slideCharacter=nil return end
             if MrHShouldPauseAutoFloor() then return end
-            -- tplay Auto Floor's slide handshake must precede the first pivot.
-            -- Reapply on respawn or if another control resets the slide state.
-            if not Variables.slideSH or slideCharacter~=character then
-                Crouch:FireServer(true,true)
-                Variables.slideSH=true
-                slideCharacter=character
-            elseif not Variables.hook then
-                -- Same fallback as tplay Slide Bypass without the namecall hook.
-                Crouch:FireServer(true,true)
-            end
+            -- Keep the supplied crouch handshake alive on every active Heartbeat,
+            -- before any pivot, even when the slide namecall hook is installed.
+            -- Direct dispatch preserves false if cogAlt would rewrite namecalls.
+            Crouch.FireServer(Crouch,false,true)
+            Variables.slideSH=true
+            slideCharacter=character
             -- tplay pins its current target on Heartbeat, not once per interaction.
             -- Keep the destination after pickup disappears; never return to origin.
             if heldFrame then
