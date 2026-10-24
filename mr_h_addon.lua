@@ -36,7 +36,7 @@ local Info, Variables, prefix, loaded = {}, {}, "", false
 
 Info.AddonName = 'MrHAddon'
 Info.AddonTitle = "Mr H addon"
-Info.AddonVersion = '1.1.8'
+Info.AddonVersion = '1.1.9'
 
 Info.AddonFullTitle = `{Info.AddonTitle} ({Info.AddonVersion})`
 
@@ -6792,7 +6792,7 @@ if game.GameId == 2440500124 then
                 local reach=t.mode=="prompt" and math.max(4,t.object.MaxActivationDistance) or 6
                 if (root.Position-targetFrame.Position).Magnitude>reach then
                     heldFrame=targetFrame*CFrame.new(0,t.mode=="touch" and 0 or 1.5,0)
-                    t.at=now+0.35 t.corrections=(t.corrections or 0)+1
+                    t.at=now t.corrections=(t.corrections or 0)+1
                     if t.corrections>=3 then retries[t.object]={count=0,next=now+5} pending=nil end
                     status("repositioning for pickup") return
                 end
@@ -6833,7 +6833,8 @@ if game.GameId == 2440500124 then
             heldFrame=target.frame*CFrame.new(0,target.mode=="touch" and 0 or 1.5,0)
             maintainTeleport()
             root.AssemblyLinearVelocity=Vector3.zero root.AssemblyAngularVelocity=Vector3.zero
-            target.at=now+0.35 target.epoch=state.epoch pending=target
+            -- Interact on the next Heartbeat after the pivot, without a fixed wait.
+            target.at=now target.epoch=state.epoch pending=target
             status("moving to "..target.kind.." / "..target.object.Parent.Name)
         end
         local function enableAux()
@@ -6905,7 +6906,6 @@ if game.GameId == 2440500124 then
         table.insert(signals,workspace.DescendantAdded:Connect(function(object) if state.running then observe(object) end end))
         table.insert(signals,workspace.DescendantRemoving:Connect(function(object) cache[object]=nil retries[object]=nil end))
         table.insert(signals,LocalPlayer.CharacterAdded:Connect(function() pending=nil retries={} heldFrame=nil slideCharacter=nil end))
-        local elapsed=0
         table.insert(signals,Services.RunService.Heartbeat:Connect(function(dt)
             if state.disposed then return end
             if state.running then
@@ -6916,9 +6916,8 @@ if game.GameId == 2440500124 then
                     return
                 end
             end
-            elapsed=elapsed+dt clock=clock+dt
-            if elapsed<0.15 or state.busy then return end
-            elapsed=0
+            clock=clock+dt
+            if state.busy then return end
             if clock>=2 then clock=0 refresh() end
             if not state.running then return end
             state.busy=true
